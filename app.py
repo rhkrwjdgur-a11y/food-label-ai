@@ -19,9 +19,9 @@ st.markdown("""
 
 # --- 스트림릿 비밀 금고에서 골든 키(API Key) 자동으로 불러오기 ---
 try:
-    openai_api_key = st.secrets["OPENAI_API_KEY"]
+    openai_api_key = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
-    st.error("⚠️ 설정(Secrets)에 OpenAI API Key가 등록되지 않았습니다. 관리자에게 문의하세요.")
+    st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다. 관리자에게 문의하세요.")
     st.stop()
 
 # --- [핵심 변경] 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 ---
