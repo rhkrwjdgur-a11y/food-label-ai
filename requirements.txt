@@ -1,0 +1,11 @@
+streamlit
+langchain
+langchain-openai
+langchain-community
+langchain-text-splitters
+faiss-cpu
+pypdf
+unstructured
+openpyxl
+pandas
+tiktoken
