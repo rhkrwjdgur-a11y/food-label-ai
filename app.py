@@ -24,8 +24,7 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다. 관리자에게 문의하세요.")
     st.stop()
 
-# --- 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 (txt 파일 추가 완료) ---
-# 현재 폴더에 있는 모든 PDF, 엑셀, 텍스트 파일을 찾아서 리스트로 만듭니다.
+# --- 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
 
 with st.sidebar:
@@ -35,7 +34,7 @@ with st.sidebar:
         for f in pre_uploaded_files:
             st.write(f"- {f}")
 
-# --- 핵심 RAG 분석 로직 (구글 Gemini 모델 및 TextLoader 적용) ---
+# --- 핵심 RAG 분석 로직 (구글 Gemini 최신 모델 적용) ---
 @st.cache_resource 
 def load_and_index_documents(_file_list, api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
@@ -64,8 +63,8 @@ def load_and_index_documents(_file_list, api_key):
     )
     splits = text_splitter.split_documents(documents)
 
-    # 임베딩 및 벡터 스토어 생성 (구글 전용 임베딩)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    # 임베딩 및 벡터 스토어 생성 (구글 최신 전용 임베딩으로 변경 완료!)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
     return vectorstore
 
