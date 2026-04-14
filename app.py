@@ -63,8 +63,8 @@ def load_and_index_documents(_file_list, api_key):
     )
     splits = text_splitter.split_documents(documents)
 
-    # 임베딩 및 벡터 스토어 생성 (구글 최신 전용 임베딩으로 변경 완료!)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    # 임베딩 및 벡터 스토어 생성 (가장 안정적인 기본 모델)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
     return vectorstore
 
