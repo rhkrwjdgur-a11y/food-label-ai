@@ -1,9 +1,9 @@
 import streamlit as st
 import os
 import glob
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -19,26 +19,26 @@ st.markdown("""
 
 # --- 스트림릿 비밀 금고에서 골든 키(API Key) 자동으로 불러오기 ---
 try:
-    openai_api_key = st.secrets["GOOGLE_API_KEY"]
+    google_api_key = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다. 관리자에게 문의하세요.")
     st.stop()
 
-# --- [핵심 변경] 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 ---
-# 현재 폴더에 있는 모든 PDF 및 엑셀 파일을 찾아서 리스트로 만듭니다.
-pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls")
+# --- 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 (txt 파일 추가 완료) ---
+# 현재 폴더에 있는 모든 PDF, 엑셀, 텍스트 파일을 찾아서 리스트로 만듭니다.
+pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
 
 with st.sidebar:
     st.header("📚 AI 학습 데이터 현황")
-    st.success(f"총 {len(pre_uploaded_files)}개의 규정 및 FAQ 문서가 시스템 뇌에 탑재되었습니다.")
+    st.success(f"총 {len(pre_uploaded_files)}개의 규정 및 핵심 요약 문서가 시스템 뇌에 탑재되었습니다.")
     with st.expander("탑재된 문서 목록 보기"):
         for f in pre_uploaded_files:
             st.write(f"- {f}")
 
-# --- 핵심 RAG 분석 로직 ---
-@st.cache_resource # 문서를 매번 새로 읽지 않고 한 번만 읽어서 메모리에 저장(속도 향상)
+# --- 핵심 RAG 분석 로직 (구글 Gemini 모델 및 TextLoader 적용) ---
+@st.cache_resource 
 def load_and_index_documents(_file_list, api_key):
-    os.environ["OPENAI_API_KEY"] = api_key
+    os.environ["GOOGLE_API_KEY"] = api_key
     documents = []
     
     # 깃허브에 있는 파일들을 직접 읽어옵니다.
@@ -48,6 +48,9 @@ def load_and_index_documents(_file_list, api_key):
             documents.extend(loader.load())
         elif file_path.lower().endswith(('.xls', '.xlsx')):
             loader = UnstructuredExcelLoader(file_path)
+            documents.extend(loader.load())
+        elif file_path.lower().endswith('.txt'):
+            loader = TextLoader(file_path, encoding='utf-8')
             documents.extend(loader.load())
 
     if not documents:
@@ -61,8 +64,8 @@ def load_and_index_documents(_file_list, api_key):
     )
     splits = text_splitter.split_documents(documents)
 
-    # 임베딩 및 벡터 스토어 생성
-    embeddings = OpenAIEmbeddings()
+    # 임베딩 및 벡터 스토어 생성 (구글 전용 임베딩)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
     return vectorstore
 
@@ -72,6 +75,9 @@ def analyze_query(vectorstore, user_query):
     template = """
     당신은 대한민국 식품위생법, 식품 등의 표시·광고에 관한 법률, 농수산물의 원산지 표시 등에 관한 법률을 전문으로 분석하는 AI 법률 검토 보조 시스템입니다.
     사용자가 질문과 함께 제공한 [참조 법률 문서 및 FAQ]만을 바탕으로 답변을 작성해야 합니다. 참조 문서에 명시되지 않은 처분 기준이나 내용을 임의로 생성(Hallucination)하여 답변하는 것을 엄격히 금지합니다. 관련 법령이 참조 문서에 없다면 "제공된 문서에서 해당 위반에 대한 처분 기준을 찾을 수 없습니다"라고 답변하십시오.
+
+    [특수 검토 규칙]: 
+    소화가 잘되는 우유 등 특수 유제품의 무지유고형분(SNF) 규격 판정 시, 별도의 지시가 없더라도 반드시 Brix 측정값에서 지방값을 뺀 수치를 SNF 값으로 잡아서 계산하고 법적 기준 부합 여부를 검증하십시오.
 
     분석 결과는 반드시 다음 구조를 준수하여 작성하십시오.
 
@@ -88,7 +94,9 @@ def analyze_query(vectorstore, user_query):
     {question}
     """
     prompt = PromptTemplate.from_template(template)
-    llm = ChatOpenAI(model_name="gpt-4-turbo", temperature=0)
+    
+    # LLM (Google Gemini 1.5 Pro 모델 사용)
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0)
 
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
@@ -111,10 +119,10 @@ if st.button("분석 실행", type="primary"):
     elif not user_question:
         st.warning("⚠️ 분석할 질문을 입력해주세요.")
     else:
-        with st.spinner("AI가 탑재된 법령과 FAQ를 기반으로 분석 중입니다... 잠시만 기다려주세요."):
+        with st.spinner("구글 AI가 탑재된 법령과 FAQ를 기반으로 분석 중입니다... 잠시만 기다려주세요."):
             try:
                 # 1. 문서 학습 (캐싱되어 있으면 즉시 로드)
-                vector_db = load_and_index_documents(pre_uploaded_files, openai_api_key)
+                vector_db = load_and_index_documents(pre_uploaded_files, google_api_key)
                 if vector_db is None:
                     st.error("문서를 학습하는 중 오류가 발생했습니다.")
                 else:
