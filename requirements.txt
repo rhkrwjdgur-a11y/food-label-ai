@@ -1,6 +1,6 @@
 streamlit
 langchain
-langchain-openai
+langchain-google-genai
 langchain-community
 langchain-text-splitters
 faiss-cpu
@@ -8,4 +8,3 @@ pypdf
 unstructured
 openpyxl
 pandas
-tiktoken
