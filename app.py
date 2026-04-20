@@ -60,7 +60,7 @@ def add_with_retry(vectorstore, batch, max_retries=4):
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list, api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
     # 이미 만들어진 DB가 있으면 즉시 로드
     if os.path.exists(DB_PATH):
