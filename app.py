@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import glob
+import time  # 💡 과부하 방지(휴식)를 위한 모듈 추가
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -32,23 +33,23 @@ with st.sidebar:
     st.header("📚 AI 학습 데이터 현황")
     st.success(f"총 {len(pre_uploaded_files)}개의 규정 및 핵심 요약 문서가 감지되었습니다.")
 
-# --- 핵심 RAG 분석 로직 (시각적 진행률 표시 + 저장/불러오기 탑재) ---
+# --- 핵심 RAG 분석 로직 (과부하 방지 시스템 탑재) ---
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list, api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     
-    # 💡 이미 만들어진 뇌(DB)가 폴더에 있다면 1초 컷으로 로드!
+    # 💡 [핵심 1] 새 API 키와 호환되는 가장 강력하고 최신인 임베딩 모델 적용
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    
+    # 💡 이미 만들어진 DB 폴더가 있으면 0.1초 컷으로 즉시 로드!
     if os.path.exists(DB_PATH):
         return FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
 
     documents = []
-    
-    # ✨ 화면에 실시간 진행률 바 생성
     progress_bar = st.progress(0, text="🧠 AI 뇌(DB) 최초 생성 중... (데이터가 방대하여 5~10분 소요됩니다)")
 
+    # 1. 파일 읽기 단계
     for i, file_path in enumerate(_file_list):
-        # 현재 어떤 파일을 읽고 있는지 화면에 텍스트와 게이지로 표시
         progress_bar.progress((i + 1) / len(_file_list), text=f"[{i+1}/{len(_file_list)}] 📄 '{file_path}' 정독 중...")
         try:
             if file_path.lower().endswith('.pdf'):
@@ -63,19 +64,33 @@ def load_and_index_documents(_file_list, api_key):
         except Exception as e:
             st.warning(f"⚠️ {file_path} 로딩 실패: {e}")
 
-    progress_bar.progress(1.0, text="✅ 파일 읽기 완료! 구글 AI로 데이터 변환(임베딩) 중... (1~2분 추가 소요)")
-
-    if not documents:
-        return None
-
-    # 텍스트 분할 및 벡터 DB 생성
+    # 2. 텍스트 분할 단계
     splits = RecursiveCharacterTextSplitter(
         chunk_size=1000, chunk_overlap=200, length_function=len
     ).split_documents(documents)
 
-    vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-    vectorstore.save_local(DB_PATH)  # 벡터 DB 로컬 저장
-    
+    if not documents or len(splits) == 0:
+        progress_bar.empty()
+        return None
+
+    total_splits = len(splits)
+    progress_bar.progress(1.0, text=f"✅ 파일 정독 완료! 총 {total_splits}개의 조각으로 뇌 변환을 시작합니다...")
+
+    # 💡 [핵심 2] 구글 서버 과부하 방지 (Traffic Control)
+    # 첫 번째 조각으로 빈 깡통(벡터 DB)을 먼저 생성합니다.
+    vectorstore = FAISS.from_documents(documents=[splits[0]], embedding=embeddings)
+
+    # 남은 조각들을 50개씩 쪼개서 넣으며 구글 서버의 429 에러를 원천 차단합니다.
+    batch_size = 50
+    for i in range(1, total_splits, batch_size):
+        progress_msg = f"🧠 구글 서버로 데이터 안전 전송 중... ({i}/{total_splits} 조각 완료) - 과부하 방지 가동 중"
+        progress_bar.progress(min(1.0, i / total_splits), text=progress_msg)
+        
+        batch = splits[i : i + batch_size]
+        vectorstore.add_documents(batch)
+        time.sleep(2)  # 2초간 강제 휴식을 취해 한도 초과 에러 방지
+
+    vectorstore.save_local(DB_PATH)  # 완성된 뇌를 폴더에 영구 저장
     progress_bar.empty()  # 작업이 완전히 끝나면 진행률 바 숨기기
     return vectorstore
 
@@ -113,7 +128,6 @@ if st.button("분석 실행", type="primary"):
     elif not user_question:
         st.warning("⚠️ 분석할 질문을 입력해주세요.")
     else:
-        # 상태 표시줄(st.status) 적용
         with st.status("📂 문서 준비 중...", expanded=False) as status:
             vector_db = load_and_index_documents(tuple(pre_uploaded_files), google_api_key)
             status.update(label="✅ 준비 완료", state="complete")
@@ -138,5 +152,4 @@ if st.button("분석 실행", type="primary"):
                 | StrOutputParser()
             )
 
-            # st.write_stream을 활용한 실시간 타이핑 효과 출력
             st.write_stream(rag_chain.stream(user_question))
