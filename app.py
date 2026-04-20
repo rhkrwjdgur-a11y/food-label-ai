@@ -33,13 +33,32 @@ with st.sidebar:
     st.header("📚 AI 학습 데이터 현황")
     st.success(f"총 {len(pre_uploaded_files)}개의 규정 및 핵심 요약 문서가 감지되었습니다.")
 
-    # DB 초기화 버튼 (문서 변경 시 수동으로 재생성 가능)
     if st.button("🔄 DB 초기화 (문서 변경 시 클릭)"):
         import shutil
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
             st.cache_resource.clear()
             st.success("DB가 초기화되었습니다. 페이지를 새로고침하세요.")
+
+# --- 임베딩 모델 자동 탐색 ---
+# 환경/버전마다 작동하는 모델명이 다르므로 순서대로 시도
+def get_embeddings(api_key):
+    os.environ["GOOGLE_API_KEY"] = api_key
+    candidates = [
+        "text-embedding-004",         # 1순위: 접두사 없이 (최신 langchain 권장)
+        "models/text-embedding-004",  # 2순위: 접두사 포함
+        "models/embedding-001",       # 3순위: 구버전 이름
+    ]
+    last_error = None
+    for model_name in candidates:
+        try:
+            emb = GoogleGenerativeAIEmbeddings(model=model_name)
+            emb.embed_query("테스트")  # 실제 호출로 작동 여부 확인
+            return emb, model_name
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(f"사용 가능한 임베딩 모델을 찾을 수 없습니다. 마지막 오류: {last_error}")
 
 # --- 재시도 로직 (429 에러 자동 대응) ---
 def add_with_retry(vectorstore, batch, max_retries=4):
@@ -49,7 +68,7 @@ def add_with_retry(vectorstore, batch, max_retries=4):
             return
         except Exception as e:
             if "429" in str(e) or "quota" in str(e).lower():
-                wait = 2 ** attempt  # 1초 → 2초 → 4초 → 8초 지수 백오프
+                wait = 2 ** attempt  # 1 → 2 → 4 → 8초
                 st.toast(f"⏳ API 한도 초과 감지, {wait}초 대기 후 재시도...")
                 time.sleep(wait)
             else:
@@ -59,8 +78,8 @@ def add_with_retry(vectorstore, batch, max_retries=4):
 # --- 핵심 RAG 로직 ---
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list, api_key):
-    os.environ["GOOGLE_API_KEY"] = api_key
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    embeddings, model_name = get_embeddings(api_key)
+    st.sidebar.info(f"✅ 임베딩 모델: `{model_name}`")
 
     # 이미 만들어진 DB가 있으면 즉시 로드
     if os.path.exists(DB_PATH):
@@ -100,21 +119,19 @@ def load_and_index_documents(_file_list, api_key):
     total_splits = len(splits)
     progress_bar.progress(0.0, text=f"✅ 파일 정독 완료! 총 {total_splits}개 조각 → 임베딩 시작")
 
-    # 3단계: 임베딩 및 FAISS DB 생성
-    # 첫 번째 조각으로 DB 초기화
+    # 3단계: 첫 번째 조각으로 DB 초기화
     vectorstore = FAISS.from_documents(documents=[splits[0]], embedding=embeddings)
 
-    # ✅ 개선: 배치 크기 100, 재시도 로직 적용, sleep 최소화
+    # 4단계: 나머지 조각 100개씩 배치 처리
     batch_size = 100
     for i in range(1, total_splits, batch_size):
-        progress = min(1.0, i / total_splits)
         progress_bar.progress(
-            progress,
+            min(1.0, i / total_splits),
             text=f"🧠 임베딩 중... ({i}/{total_splits} 조각 완료)"
         )
         batch = splits[i : i + batch_size]
         add_with_retry(vectorstore, batch)
-        time.sleep(0.5)  # ✅ 2초 → 0.5초로 단축 (429 발생 시 재시도 로직이 자동 처리)
+        time.sleep(0.5)
 
     vectorstore.save_local(DB_PATH)
     progress_bar.empty()
@@ -161,6 +178,7 @@ if st.button("분석 실행", type="primary"):
         if vector_db:
             st.markdown("### 📊 분석 결과 리포트")
 
+            embeddings, _ = get_embeddings(google_api_key)
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
