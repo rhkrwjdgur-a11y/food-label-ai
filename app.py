@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import glob
-import time  # 💡 과부하 방지(휴식)를 위한 모듈 추가
+import time
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -18,39 +18,63 @@ st.markdown("""
 (시스템 내부에 식약처 고시 및 연도별 FAQ 문서가 이미 학습되어 있습니다.)
 """)
 
-# --- 스트림릿 비밀 금고에서 골든 키(API Key) 자동으로 불러오기 ---
+# --- API Key 로드 ---
 try:
     google_api_key = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다. 관리자에게 문의하세요.")
     st.stop()
 
-# --- 깃허브에 올라간 문서들을 자동으로 스캔하여 목록화 ---
+# --- 문서 자동 스캔 ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
-DB_PATH = "faiss_index_db"  # AI 뇌가 저장될 폴더 이름
+DB_PATH = "faiss_index_db"
 
 with st.sidebar:
     st.header("📚 AI 학습 데이터 현황")
     st.success(f"총 {len(pre_uploaded_files)}개의 규정 및 핵심 요약 문서가 감지되었습니다.")
 
-# --- 핵심 RAG 분석 로직 (과부하 방지 시스템 탑재) ---
+    # DB 초기화 버튼 (문서 변경 시 수동으로 재생성 가능)
+    if st.button("🔄 DB 초기화 (문서 변경 시 클릭)"):
+        import shutil
+        if os.path.exists(DB_PATH):
+            shutil.rmtree(DB_PATH)
+            st.cache_resource.clear()
+            st.success("DB가 초기화되었습니다. 페이지를 새로고침하세요.")
+
+# --- 재시도 로직 (429 에러 자동 대응) ---
+def add_with_retry(vectorstore, batch, max_retries=4):
+    for attempt in range(max_retries):
+        try:
+            vectorstore.add_documents(batch)
+            return
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                wait = 2 ** attempt  # 1초 → 2초 → 4초 → 8초 지수 백오프
+                st.toast(f"⏳ API 한도 초과 감지, {wait}초 대기 후 재시도...")
+                time.sleep(wait)
+            else:
+                raise e
+    raise RuntimeError(f"최대 재시도 횟수({max_retries})를 초과했습니다.")
+
+# --- 핵심 RAG 로직 ---
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list, api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
-    
-    # 💡 [핵심 1] 새 API 키와 호환되는 가장 강력하고 최신인 임베딩 모델 적용
     embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-    
-    # 💡 이미 만들어진 DB 폴더가 있으면 0.1초 컷으로 즉시 로드!
+
+    # 이미 만들어진 DB가 있으면 즉시 로드
     if os.path.exists(DB_PATH):
         return FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
 
     documents = []
-    progress_bar = st.progress(0, text="🧠 AI 뇌(DB) 최초 생성 중... (데이터가 방대하여 5~10분 소요됩니다)")
+    progress_bar = st.progress(0, text="🧠 AI DB 최초 생성 중...")
 
-    # 1. 파일 읽기 단계
+    # 1단계: 파일 읽기
     for i, file_path in enumerate(_file_list):
-        progress_bar.progress((i + 1) / len(_file_list), text=f"[{i+1}/{len(_file_list)}] 📄 '{file_path}' 정독 중...")
+        progress_bar.progress(
+            (i + 1) / len(_file_list),
+            text=f"[{i+1}/{len(_file_list)}] 📄 '{file_path}' 정독 중..."
+        )
         try:
             if file_path.lower().endswith('.pdf'):
                 loader = PyPDFLoader(file_path)
@@ -64,37 +88,39 @@ def load_and_index_documents(_file_list, api_key):
         except Exception as e:
             st.warning(f"⚠️ {file_path} 로딩 실패: {e}")
 
-    # 2. 텍스트 분할 단계
+    if not documents:
+        progress_bar.empty()
+        return None
+
+    # 2단계: 텍스트 분할
     splits = RecursiveCharacterTextSplitter(
         chunk_size=1000, chunk_overlap=200, length_function=len
     ).split_documents(documents)
 
-    if not documents or len(splits) == 0:
-        progress_bar.empty()
-        return None
-
     total_splits = len(splits)
-    progress_bar.progress(1.0, text=f"✅ 파일 정독 완료! 총 {total_splits}개의 조각으로 뇌 변환을 시작합니다...")
+    progress_bar.progress(0.0, text=f"✅ 파일 정독 완료! 총 {total_splits}개 조각 → 임베딩 시작")
 
-    # 💡 [핵심 2] 구글 서버 과부하 방지 (Traffic Control)
-    # 첫 번째 조각으로 빈 깡통(벡터 DB)을 먼저 생성합니다.
+    # 3단계: 임베딩 및 FAISS DB 생성
+    # 첫 번째 조각으로 DB 초기화
     vectorstore = FAISS.from_documents(documents=[splits[0]], embedding=embeddings)
 
-    # 남은 조각들을 50개씩 쪼개서 넣으며 구글 서버의 429 에러를 원천 차단합니다.
-    batch_size = 50
+    # ✅ 개선: 배치 크기 100, 재시도 로직 적용, sleep 최소화
+    batch_size = 100
     for i in range(1, total_splits, batch_size):
-        progress_msg = f"🧠 구글 서버로 데이터 안전 전송 중... ({i}/{total_splits} 조각 완료) - 과부하 방지 가동 중"
-        progress_bar.progress(min(1.0, i / total_splits), text=progress_msg)
-        
+        progress = min(1.0, i / total_splits)
+        progress_bar.progress(
+            progress,
+            text=f"🧠 임베딩 중... ({i}/{total_splits} 조각 완료)"
+        )
         batch = splits[i : i + batch_size]
-        vectorstore.add_documents(batch)
-        time.sleep(2)  # 2초간 강제 휴식을 취해 한도 초과 에러 방지
+        add_with_retry(vectorstore, batch)
+        time.sleep(0.5)  # ✅ 2초 → 0.5초로 단축 (429 발생 시 재시도 로직이 자동 처리)
 
-    vectorstore.save_local(DB_PATH)  # 완성된 뇌를 폴더에 영구 저장
-    progress_bar.empty()  # 작업이 완전히 끝나면 진행률 바 숨기기
+    vectorstore.save_local(DB_PATH)
+    progress_bar.empty()
     return vectorstore
 
-# --- 템플릿 및 문서 포맷 함수 정의 ---
+# --- 프롬프트 템플릿 ---
 TEMPLATE = """
 당신은 대한민국 식품위생법, 식품 등의 표시·광고에 관한 법률, 농수산물의 원산지 표시 등에 관한 법률을 전문으로 분석하는 AI 법률 검토 보조 시스템입니다.
 사용자가 질문과 함께 제공한 [참조 법률 문서 및 FAQ]만을 바탕으로 답변을 작성해야 합니다. 참조 문서에 명시되지 않은 처분 기준이나 내용을 임의로 생성(Hallucination)하여 답변하는 것을 엄격히 금지합니다. 관련 법령이 참조 문서에 없다면 "제공된 문서에서 해당 위반에 대한 처분 기준을 찾을 수 없습니다"라고 답변하십시오.
@@ -119,7 +145,7 @@ TEMPLATE = """
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-# --- 사용자 질의 UI 및 분석 실행 ---
+# --- 사용자 질의 UI ---
 user_question = st.text_area("분석할 표시사항 위반 의심 사례나 질문을 구체적으로 입력하세요:", height=150)
 
 if st.button("분석 실행", type="primary"):
@@ -134,11 +160,10 @@ if st.button("분석 실행", type="primary"):
 
         if vector_db:
             st.markdown("### 📊 분석 결과 리포트")
-            
+
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-            # Gemini 1.5 Flash 모델 + 스트리밍 모드 적용 (답변이 실시간으로 타이핑됨)
             llm = ChatGoogleGenerativeAI(
                 model="gemini-1.5-flash",
                 temperature=0,
