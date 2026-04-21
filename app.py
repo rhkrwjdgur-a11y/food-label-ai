@@ -41,26 +41,29 @@ with st.sidebar:
             st.success("DB가 초기화되었습니다. 페이지를 새로고침하세요.")
 
 # --- 임베딩 모델 자동 탐색 ---
-# 환경/버전마다 작동하는 모델명이 다르므로 순서대로 시도
 def get_embeddings(api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
+    # langchain-google-genai 2.1.x + protobuf 5.x 환경 기준 모델명
     candidates = [
-        "text-embedding-004",         # 1순위: 접두사 없이 (최신 langchain 권장)
-        "models/text-embedding-004",  # 2순위: 접두사 포함
-        "models/embedding-001",       # 3순위: 구버전 이름
+        "models/text-embedding-004",
+        "text-embedding-004",
+        "models/embedding-001",
     ]
-    last_error = None
+    errors = []
     for model_name in candidates:
         try:
             emb = GoogleGenerativeAIEmbeddings(model=model_name)
-            emb.embed_query("테스트")  # 실제 호출로 작동 여부 확인
+            emb.embed_query("테스트")
             return emb, model_name
         except Exception as e:
-            last_error = e
+            errors.append(f"{model_name}: {str(e)}")
             continue
-    raise RuntimeError(f"사용 가능한 임베딩 모델을 찾을 수 없습니다. 마지막 오류: {last_error}")
 
-# --- 재시도 로직 (429 에러 자동 대응) ---
+    # 화면에 실제 에러 표시
+    st.error("임베딩 모델 오류 상세:\n" + "\n".join(errors))
+    st.stop()
+
+# --- 재시도 로직 ---
 def add_with_retry(vectorstore, batch, max_retries=4):
     for attempt in range(max_retries):
         try:
@@ -68,7 +71,7 @@ def add_with_retry(vectorstore, batch, max_retries=4):
             return
         except Exception as e:
             if "429" in str(e) or "quota" in str(e).lower():
-                wait = 2 ** attempt  # 1 → 2 → 4 → 8초
+                wait = 2 ** attempt
                 st.toast(f"⏳ API 한도 초과 감지, {wait}초 대기 후 재시도...")
                 time.sleep(wait)
             else:
@@ -81,14 +84,12 @@ def load_and_index_documents(_file_list, api_key):
     embeddings, model_name = get_embeddings(api_key)
     st.sidebar.info(f"✅ 임베딩 모델: `{model_name}`")
 
-    # 이미 만들어진 DB가 있으면 즉시 로드
     if os.path.exists(DB_PATH):
         return FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
 
     documents = []
     progress_bar = st.progress(0, text="🧠 AI DB 최초 생성 중...")
 
-    # 1단계: 파일 읽기
     for i, file_path in enumerate(_file_list):
         progress_bar.progress(
             (i + 1) / len(_file_list),
@@ -111,7 +112,6 @@ def load_and_index_documents(_file_list, api_key):
         progress_bar.empty()
         return None
 
-    # 2단계: 텍스트 분할
     splits = RecursiveCharacterTextSplitter(
         chunk_size=1000, chunk_overlap=200, length_function=len
     ).split_documents(documents)
@@ -119,10 +119,8 @@ def load_and_index_documents(_file_list, api_key):
     total_splits = len(splits)
     progress_bar.progress(0.0, text=f"✅ 파일 정독 완료! 총 {total_splits}개 조각 → 임베딩 시작")
 
-    # 3단계: 첫 번째 조각으로 DB 초기화
     vectorstore = FAISS.from_documents(documents=[splits[0]], embedding=embeddings)
 
-    # 4단계: 나머지 조각 100개씩 배치 처리
     batch_size = 100
     for i in range(1, total_splits, batch_size):
         progress_bar.progress(
