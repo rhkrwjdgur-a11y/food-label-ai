@@ -2,13 +2,16 @@ import streamlit as st
 import os
 import glob
 import time
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import UnstructuredExcelLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+import pandas as pd
 
 # --- 웹페이지 기본 설정 ---
 st.set_page_config(page_title="AI 식품 표시사항 검토 시스템", page_icon="🥛", layout="wide")
@@ -40,10 +43,23 @@ with st.sidebar:
             st.cache_resource.clear()
             st.success("DB가 초기화되었습니다. 페이지를 새로고침하세요.")
 
+# --- 엑셀 로더 (unstructured 없이 pandas로 직접 처리) ---
+def load_excel(file_path):
+    try:
+        xl = pd.ExcelFile(file_path)
+        docs = []
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet).fillna("")
+            text = f"[시트: {sheet}]\n" + df.to_string(index=False)
+            docs.append(Document(page_content=text, metadata={"source": file_path, "sheet": sheet}))
+        return docs
+    except Exception as e:
+        st.warning(f"⚠️ 엑셀 로딩 실패 ({file_path}): {e}")
+        return []
+
 # --- 임베딩 모델 자동 탐색 ---
 def get_embeddings(api_key):
     os.environ["GOOGLE_API_KEY"] = api_key
-    # langchain-google-genai 2.1.x + protobuf 5.x 환경 기준 모델명
     candidates = [
         "models/text-embedding-004",
         "text-embedding-004",
@@ -58,8 +74,6 @@ def get_embeddings(api_key):
         except Exception as e:
             errors.append(f"{model_name}: {str(e)}")
             continue
-
-    # 화면에 실제 에러 표시
     st.error("임베딩 모델 오류 상세:\n" + "\n".join(errors))
     st.stop()
 
@@ -98,13 +112,12 @@ def load_and_index_documents(_file_list, api_key):
         try:
             if file_path.lower().endswith('.pdf'):
                 loader = PyPDFLoader(file_path)
+                documents.extend(loader.load())
             elif file_path.lower().endswith(('.xls', '.xlsx')):
-                loader = UnstructuredExcelLoader(file_path)
+                documents.extend(load_excel(file_path))  # pandas 기반 로더
             elif file_path.lower().endswith('.txt'):
                 loader = TextLoader(file_path, encoding='utf-8')
-            else:
-                continue
-            documents.extend(loader.load())
+                documents.extend(loader.load())
         except Exception as e:
             st.warning(f"⚠️ {file_path} 로딩 실패: {e}")
 
