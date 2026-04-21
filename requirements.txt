@@ -1,9 +1,10 @@
 streamlit
-langchain==0.3.7
-langchain-google-genai==2.0.7
-langchain-community==0.3.7
-langchain-core==0.3.19
-langchain-text-splitters==0.3.2
+langchain==0.2.16
+langchain-google-genai==1.0.10
+langchain-community==0.2.16
+langchain-core==0.2.38
+langchain-text-splitters==0.2.4
+google-generativeai==0.7.2
 faiss-cpu
 pypdf
 unstructured
