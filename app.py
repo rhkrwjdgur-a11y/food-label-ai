@@ -122,13 +122,14 @@ if st.button("분석 실행", type="primary"):
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-            # 💡 답변은 여전히 똑똑한 구글 Gemini를 사용합니다. (이건 에러가 안 납니다!)
-            os.environ["GOOGLE_API_KEY"] = google_api_key
+           # 💡 답변은 여전히 똑똑한 구글 Gemini를 사용합니다. 
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
+                model="gemini-1.5-flash-latest",  # 명확한 최신 버전 명시
+                api_key=google_api_key,           # 환경변수 대신 직접 키 주입
                 temperature=0,
                 streaming=True
             )
+        
 
             rag_chain = (
                 {"context": retriever | format_docs, "question": RunnablePassthrough()}
