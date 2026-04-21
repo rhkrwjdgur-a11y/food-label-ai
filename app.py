@@ -106,14 +106,14 @@ if st.button("분석 실행", type="primary"):
             retriever = vector_db.as_retriever(search_kwargs={"k": 4})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-           # 💡 [핵심] 계정 권한 충돌이 없는 가장 안정적인 범용 모델로 교체!
+          # 💡 [핵심] 2026년 기준 구글의 최신 표준 모델인 2.5 버전으로 교체! 
+            # (구형 1.5 및 1.0은 구글 서버에서 단종되어 404 에러를 발생시켰던 것입니다)
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.0-pro",  # 1.5-flash 대신 1.0-pro 적용
+                model="gemini-2.5-flash",  
                 api_key=google_api_key,
                 temperature=0,
                 streaming=True
             )
-
             rag_chain = (
                 {"context": retriever | format_docs, "question": RunnablePassthrough()}
                 | prompt | llm | StrOutputParser()
