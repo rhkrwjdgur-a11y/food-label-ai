@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.40.0
 langchain
 langchain-google-genai==2.1.2
 langchain-community
