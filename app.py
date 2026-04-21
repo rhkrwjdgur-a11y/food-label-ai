@@ -122,10 +122,10 @@ if st.button("분석 실행", type="primary"):
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": 4})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-           # 💡 답변은 여전히 똑똑한 구글 Gemini를 사용합니다. 
+         # 💡 정답: models/ 접두사와 -latest 꼬리표를 모두 제거한 순정 이름
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash-latest",  # 명확한 최신 버전 명시
-                api_key=google_api_key,           # 환경변수 대신 직접 키 주입
+                model="gemini-1.5-flash",
+                api_key=google_api_key,
                 temperature=0,
                 streaming=True
             )
