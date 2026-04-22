@@ -115,9 +115,9 @@ if st.button("분석 실행", type="primary"):
             retriever = vector_db.as_retriever(search_kwargs={"k": 8})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-            # 💡 [핵심] 가장 표준적이고 오류 없는 모델명 사용
+           # 💡 [핵심] 회원님 말씀이 맞습니다! 404 에러를 완벽히 우회하는 최신 2.5 버전으로 고정!
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash", 
+                model="gemini-2.5-flash", 
                 api_key=google_api_key,
                 temperature=0,
                 streaming=True
