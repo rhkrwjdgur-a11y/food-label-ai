@@ -27,9 +27,9 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 문서 목록화 및 저장 경로 ---
+# --- 문서 목록화 및 💡 [에러 해결] 새로운 DB 경로 지정 ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
-DB_PATH = "faiss_index_db_local" 
+DB_PATH = "faiss_index_db_korean_v1" # 옛날 384차원 DB와 충돌하지 않도록 완전히 새로운 이름 부여
 
 # --- 핵심 RAG 로직 (한국어 특화 로컬 임베딩) ---
 @st.cache_resource(show_spinner=False)
@@ -111,10 +111,11 @@ if st.button("분석 실행", type="primary"):
         if vector_db:
             st.markdown("### 📊 분석 결과 리포트")
             
-            # 💡 [핵심] 정답 누락 방지를 위해 탐색 범위를 4개에서 8개로 2배 확장
+            # 💡 [핵심] 정답 누락 방지를 위해 탐색 범위를 8개로 확장
             retriever = vector_db.as_retriever(search_kwargs={"k": 8})
             prompt = PromptTemplate.from_template(TEMPLATE)
 
+            # 💡 [핵심] 가장 표준적이고 오류 없는 모델명 사용
             llm = ChatGoogleGenerativeAI(
                 model="gemini-1.5-flash", 
                 api_key=google_api_key,
