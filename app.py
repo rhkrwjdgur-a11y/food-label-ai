@@ -17,7 +17,7 @@ st.set_page_config(page_title="AI 식품 표시사항 검토 시스템", page_ic
 st.title("🥛 연세유업 AI 식품 표시사항 및 행정처분 검토 시스템")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(한국어 특화 로컬 임베딩과 최적화된 Gemini 엔진이 탑재되어 즉시 분석합니다.)
+(한국어 특화 로컬 임베딩과 최신 Gemini 2.5 엔진이 탑재되어 즉시 분석합니다.)
 """)
 
 # --- API Key 설정 ---
@@ -27,14 +27,14 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 문서 목록화 및 💡 [에러 해결] 새로운 DB 경로 지정 ---
+# --- 문서 목록화 및 💡 새로운 DB 경로 지정 (뇌 강제 업데이트) ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
-DB_PATH = "faiss_index_db_korean_v1" # 옛날 384차원 DB와 충돌하지 않도록 완전히 새로운 이름 부여
+DB_PATH = "faiss_index_db_final_v2" 
 
 # --- 핵심 RAG 로직 (한국어 특화 로컬 임베딩) ---
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list):
-    # 💡 [핵심] 한국어 법률/실무 데이터에 특화된 최고 성능 오픈소스 사서(임베딩) 적용
+    # 💡 [핵심] 한국어 법률/실무 데이터에 특화된 최고 성능 오픈소스 사서 적용
     embeddings = HuggingFaceEmbeddings(model_name="jhgan/ko-sroberta-multitask")
     
     if os.path.exists(DB_PATH):
@@ -67,7 +67,7 @@ def load_and_index_documents(_file_list):
 # --- 💡 연세유업 품질관리 전용 AI 지침 (프롬프트 템플릿 완결판) ---
 TEMPLATE = """
 당신은 연세유업의 최고 권위 식품법령 및 품질관리 AI 비서입니다.
-사용자의 질문에 대해 오직 제공된 [참조 문서]만을 바탕으로 답변하십시오. 문서에 없는 내용을 지어내는 것을 엄격히 금지합니다.
+사용자의 질문에 대해 제공된 [참조 문서]를 바탕으로 답변하십시오.
 
 [현장 품질관리 특수 규칙]:
 1. **SNF(무지유고형분) 계산**: '소화가 잘되는 우유' 등 검토 시, [Brix 측정값 - 지방값]을 SNF 수치로 산출하여 법적 기준과 대조하십시오.
@@ -79,8 +79,8 @@ TEMPLATE = """
 
 **1. 위반 의심 사항:** (사용자 질문에서 문제가 되는 행위, 규격 미달, 표시 누락 사항을 1~2줄로 요약)
 **2. 관련 법령, 조항 및 참조 FAQ:** (참조 문서에서 찾은 정확한 근거 조항명, 별표 번호, 또는 FAQ 내용을 명시)
-**3. 행정처분:** (해당 위반 시 1차, 2차 등 차수별 행정처분 기준 명시. 문서에 없으면 '확인 불가' 처리)
-**4. 과징금 및 벌칙금 (형사처분):** (관련 금전적 제재나 벌칙 규정 요약)
+**3. 행정처분:** (참조 문서에서 정확한 기준을 찾지 못한 경우, 절대 '확인 불가'라고 쓰지 말고 AI가 학습한 대한민국 식품위생법 기본 지식을 바탕으로 정확한 행정처분 기준을 기재할 것. 단, 이 경우 "[참고: 일반 법률 지식]"이라는 문구를 덧붙일 것)
+**4. 과징금 및 벌칙금 (형사처분):** (참조 문서에 없으면 위 3번과 마찬가지로 AI의 기본 지식을 동원하여 관련 제재를 작성할 것)
 **5. 검토 의견 (품질관리 가이드):** (연세유업 현장 실무진이 어떻게 대처해야 하는지, 올바른 표시 방법이나 주의사항을 3가지 이내의 글머리 기호(•)로 요약하여 실질적인 가이드를 제공할 것)
 
 [참조 문서]:
@@ -111,11 +111,14 @@ if st.button("분석 실행", type="primary"):
         if vector_db:
             st.markdown("### 📊 분석 결과 리포트")
             
-            # 💡 [핵심] 정답 누락 방지를 위해 탐색 범위를 8개로 확장
-            retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+            # 💡 [핵심 튜닝] 검색량 2.5배 증가 및 '다양성(MMR)' 알고리즘 적용
+            # 유사한 단어만 찾지 않고, 규정과 행정처분표를 골고루 가져오도록 강제합니다.
+            retriever = vector_db.as_retriever(
+                search_type="mmr", 
+                search_kwargs={"k": 20, "fetch_k": 50} 
+            )
             prompt = PromptTemplate.from_template(TEMPLATE)
 
-           # 💡 [핵심] 회원님 말씀이 맞습니다! 404 에러를 완벽히 우회하는 최신 2.5 버전으로 고정!
             llm = ChatGoogleGenerativeAI(
                 model="gemini-2.5-flash", 
                 api_key=google_api_key,
@@ -123,8 +126,13 @@ if st.button("분석 실행", type="primary"):
                 streaming=True
             )
 
+            # 💡 [검색 부스터 유지] 사서가 별표(처분표)를 절대 놓치지 않게 키워드 강제 주입
+            def get_enhanced_context(_):
+                enhanced_query = user_question + " 별표 행정처분 기준 영업정지 과태료"
+                return format_docs(retriever.invoke(enhanced_query))
+
             rag_chain = (
-                {"context": retriever | format_docs, "question": RunnablePassthrough()}
+                {"context": get_enhanced_context, "question": RunnablePassthrough()}
                 | prompt | llm | StrOutputParser()
             )
 
