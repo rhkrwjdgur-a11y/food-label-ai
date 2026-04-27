@@ -17,7 +17,7 @@ st.set_page_config(page_title="AI 식품 표시사항 검토 시스템", page_ic
 st.title("🥛 연세유업 AI 식품 표시사항 및 행정처분 검토 시스템")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(실무 마스터 파일 최우선 적용 및 교차 검증 알고리즘이 탑재되었습니다.)
+(에이전트 RAG 다중 홉 추론 엔진 탑재: 법령과 별표를 스스로 교차 검증합니다.)
 """)
 
 # --- API Key 설정 ---
@@ -27,9 +27,9 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 문서 목록화 및 💡 마스터 파일 정독을 위한 DB 경로 강제 업데이트 (v3) ---
+# --- 문서 목록화 및 DB 경로 설정 (Agentic RAG 전용) ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
-DB_PATH = "faiss_index_db_final_v3" 
+DB_PATH = "faiss_index_db_agentic_v1" 
 
 # --- 핵심 RAG 로직 (한국어 특화 로컬 임베딩) ---
 @st.cache_resource(show_spinner=False)
@@ -63,14 +63,10 @@ def load_and_index_documents(_file_list):
     progress_bar.empty()
     return vectorstore
 
-# --- 💡 연세유업 품질관리 전용 AI 지침 (마스터 파일 우선 적용판) ---
+# --- 💡 연세유업 품질관리 전용 AI 지침 (에이전트 RAG 최종 병합판) ---
 TEMPLATE = """
 당신은 연세유업의 최고 권위 식품법령 및 품질관리 AI 비서입니다.
-사용자의 질문에 대해 오직 제공된 [참조 문서]만을 바탕으로 답변하십시오.
-
-💡 **[AI 사서 행정처분 검색 최우선 규칙]** 💡
-1순위: [참조 문서] 중에 실무 위반 사례와 처분 수위가 이미 번호(#)를 달고 요약 정리된 텍스트 내용(예: 마스터 텍스트)이 있다면, 복잡하게 교차검증하지 말고 **그 정리된 내용을 최우선으로 즉시 답변에 반영**하십시오.
-2순위: 만약 요약된 내용에 정답이 없고 원본 규정만 있다면, 그때 조항 번호(몇 조 몇 항)를 찾은 뒤 행정처분표(별표)와 교차 검증하여 도출하십시오.
+사용자의 질문에 대해 오직 제공된 [참조 문서]만을 바탕으로 답변하십시오. 지어내거나 일반 법률 지식을 사용하지 마십시오.
 
 [현장 품질관리 특수 규칙]:
 1. **SNF(무지유고형분) 계산**: '소화가 잘되는 우유' 등 검토 시, [Brix 측정값 - 지방값]을 SNF 수치로 산출하여 법적 기준과 대조하십시오.
@@ -96,8 +92,8 @@ TEMPLATE = """
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-# --- UI 및 실행 (환각 방지 철통 보안) ---
-user_question = st.text_area("사례나 분석 데이터를 입력하세요 (예: 식품이력추적관리 번호란에 선물용 수량 표기...):", height=150)
+# --- UI 및 에이전트 RAG 실행 ---
+user_question = st.text_area("사례나 분석 데이터를 입력하세요 (예: 위생복 미착용 시 처벌 기준...):", height=150)
 
 if st.button("분석 실행", type="primary"):
     if not pre_uploaded_files:
@@ -107,35 +103,65 @@ if st.button("분석 실행", type="primary"):
         st.warning("⚠️ 분석할 질문이나 데이터를 입력해주세요.")
         st.stop()
     else:
-        with st.status("📂 데이터 분석 중...", expanded=False) as status:
+        with st.status("📂 Agentic RAG 다중 추론 분석 중...", expanded=True) as status:
             vector_db = load_and_index_documents(tuple(pre_uploaded_files))
-            status.update(label="✅ 준비 완료", state="complete")
+            
+            if vector_db:
+                retriever = vector_db.as_retriever(
+                    search_type="mmr", 
+                    search_kwargs={"k": 15, "fetch_k": 40} 
+                )
+
+                llm_fast = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash", 
+                    api_key=google_api_key,
+                    temperature=0
+                )
+                
+                llm_stream = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash", 
+                    api_key=google_api_key,
+                    temperature=0,
+                    streaming=True
+                )
+
+                # 💡 [Agentic RAG 1단계]: 관련 조항 추론
+                status.update(label="🔍 1단계: 관련 법령 조항 추론 중...", state="running")
+                docs_pass_1 = retriever.invoke(user_question + " 위반 행위 법령 조항")
+                context_pass_1 = format_docs(docs_pass_1)
+
+                extraction_prompt = PromptTemplate.from_template(
+                    "사용자 질문: {question}\n\n문서: {context}\n\n위 문서에서 사용자 질문의 위반 행위에 해당하는 정확한 '법령 및 조항 번호(예: 법 제3조, 제49조 등)'를 찾아 해당 조항 번호만 짧게 출력하시오. 찾을 수 없으면 '확인 불가'라고 출력하시오."
+                )
+                extraction_chain = extraction_prompt | llm_fast | StrOutputParser()
+                article_number = extraction_chain.invoke({"question": user_question, "context": context_pass_1})
+                st.write(f"✔️ 1단계 추론 완료 (탐지된 조항: {article_number})")
+
+                # 💡 [Agentic RAG 2단계]: 조항 기반 행정처분/과태료 교차 검색
+                status.update(label=f"🔍 2단계: '{article_number}' 기반 행정처분/과태료 표 교차 검색 중...", state="running")
+                query_pass_2 = f"{article_number} 행정처분 과태료 기준 영업정지 별표"
+                docs_pass_2 = retriever.invoke(query_pass_2)
+                st.write("✔️ 2단계 검색 완료 (처분 기준표 매칭 및 데이터 확보)")
+
+                # 💡 1단계와 2단계의 문서를 모두 병합하여 중복 제거
+                combined_docs = docs_pass_1 + docs_pass_2
+                unique_contents = set()
+                final_docs = []
+                for doc in combined_docs:
+                    if doc.page_content not in unique_contents:
+                        unique_contents.add(doc.page_content)
+                        final_docs.append(doc)
+
+                final_context = "\n\n".join(doc.page_content for doc in final_docs)
+                status.update(label="✅ 다중 추론 완료. 최종 리포트 생성 시작", state="complete")
 
         if vector_db:
             st.markdown("### 📊 분석 결과 리포트")
             
-            # 💡 [핵심 튜닝] 검색량 넉넉하게 유지 및 다양성 검색(MMR)
-            retriever = vector_db.as_retriever(
-                search_type="mmr", 
-                search_kwargs={"k": 20, "fetch_k": 50} 
-            )
             prompt = PromptTemplate.from_template(TEMPLATE)
-
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash", 
-                api_key=google_api_key,
-                temperature=0,
-                streaming=True
-            )
-
-            # 💡 검색 부스터: 텍스트 요약본도 잘 긁어오도록 키워드 유지
-            def get_enhanced_context(_):
-                enhanced_query = user_question + " 별표 행정처분 기준 영업정지 과태료 위반 수위 근거"
-                return format_docs(retriever.invoke(enhanced_query))
-
             rag_chain = (
-                {"context": get_enhanced_context, "question": RunnablePassthrough()}
-                | prompt | llm | StrOutputParser()
+                {"context": lambda _: final_context, "question": RunnablePassthrough()}
+                | prompt | llm_stream | StrOutputParser()
             )
 
             st.write_stream(rag_chain.stream(user_question))
