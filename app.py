@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import glob
 import pandas as pd
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -16,7 +16,7 @@ st.set_page_config(page_title="AI 식품 표시사항 검토 시스템", page_ic
 st.title("🥛 연세유업 AI 식품 표시사항 및 행정처분 검토 시스템")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(원본 법령 및 별표를 파괴하지 않고 통째로 읽어 다중 추론하는 'Raw Document RAG' 엔진 탑재)
+(🔍 **Query Translator 탑재**: 구어체 질문을 법률 용어로 자동 번역하여 원본 법령을 다중 추론합니다.)
 """)
 
 try:
@@ -25,9 +25,9 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 💡 뇌 구조 초기화: 원본 판독 전용 DB ---
-pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.txt")
-DB_PATH = "faiss_index_db_raw_v1" 
+# --- 💡 원본 판독 전용 DB (요약본 텍스트 배제) ---
+pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls")
+DB_PATH = "faiss_index_db_raw_v2" 
 
 @st.cache_resource(show_spinner=False)
 def load_and_index_documents(_file_list):
@@ -44,15 +44,13 @@ def load_and_index_documents(_file_list):
         try:
             if file_path.lower().endswith('.pdf'):
                 documents.extend(PyPDFLoader(file_path).load())
-            elif file_path.lower().endswith('.txt'):
-                documents.extend(TextLoader(file_path, encoding='utf-8').load())
             elif file_path.lower().endswith(('.xls', '.xlsx')):
                 df = pd.read_excel(file_path)
                 documents.append(Document(page_content=df.to_markdown(index=False), metadata={"source": file_path}))
         except Exception as e:
             st.warning(f"⚠️ {file_path} 로딩 실패: {e}")
 
-    # 💡 [핵심 기술]: 문서를 10,000글자(거대 청크) 단위로 잘라 표(Table) 구조 보존
+    # 거대 청크(10,000자) 유지
     splits = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=2000).split_documents(documents)
     if not documents or len(splits) == 0: return None
 
@@ -61,18 +59,29 @@ def load_and_index_documents(_file_list):
     progress_bar.empty()
     return vectorstore
 
+# --- 💡 0단계: 질문 번역기(Query Translator) 프롬프트 ---
+TRANSLATOR_TEMPLATE = """
+당신은 대한민국 최고의 식품위생법 및 식품표시광고법 전문 변호사입니다.
+사용자의 일상적인 구어체 현장 용어를 법전(시행령, 시행규칙, 행정처분 별표)에서 정확히 매칭될 수 있는 '공식 법률 용어'로 번역하십시오.
+
+[번역 예시]
+- 일상어: "라벨 안 붙이고 원액 팔았어", "탱크로리 라벨 없음" -> 법률어: "무표시 제품 판매, 표시사항 전부 미표시"
+- 일상어: "알레르기 원료 따로 보관 안함" -> 법률어: "위생적 취급기준 위반, 교차오염 방지 분리 보관 미흡"
+- 일상어: "위생복 안 입음" -> 법률어: "위생복 미착용, 위생적 취급기준 위반"
+- 일상어: "유통기한 지난 거 씀" -> 법률어: "소비기한 경과 제품 사용 및 보관"
+
+사용자 질문: {question}
+번역된 법률 키워드 (단어 위주로 3~5개 나열):
+"""
+
+# --- 최종 답변 작성 프롬프트 ---
 TEMPLATE = """
 당신은 연세유업의 최고 권위 식품법령 및 품질관리 AI 비서입니다.
 사용자의 질문에 대해 오직 제공된 [참조 문서]의 **법령 원문과 행정처분/과태료 기준표(별표)**를 직접 분석하여 답변하십시오.
 
-💡 **[원본 교차 검증 추론 규칙]** 💡
-당신에게는 쪼개지지 않은 거대한 원본 문서가 제공됩니다. 다음 순서로 원본을 파헤치십시오.
-1. [참조 문서]에서 사용자의 질문(위반 행위)이 몇 조 몇 항 위반인지 법령 본문을 찾으십시오.
-2. 찾아낸 조항 번호(예: 제3조, 제49조 등)를 바탕으로, 함께 제공된 [참조 문서] 내의 '행정처분 기준표(별표)' 또는 '과태료 부과기준표'에서 해당 조항에 부과되는 처분 수위(1차, 2차 등)를 정확히 추적하여 추출하십시오.
-
 💡 **[최종 출력 포맷]** 💡
 **1. 위반 의심 사항:** (질문에서 문제가 되는 행위를 1~2줄 요약)
-**2. 관련 법령, 조항 및 참조 FAQ:** (원본 문서에서 찾은 정확한 조항 번호 명시)
+**2. 관련 법령, 조항 및 참조 FAQ:** (원본 문서에서 찾은 정확한 법령명 및 조항 번호 명시)
 **3. 행정처분:** (별표 기준표에서 교차 검증으로 찾아낸 영업정지 등 처분 기준)
 **4. 과징금 및 벌칙금 (형사처분):** (별표 기준표에서 찾아낸 과태료 등 기준)
 **5. 검토 의견 (품질관리 가이드):** (현장 대처 방안 3가지 요약)
@@ -87,11 +96,11 @@ TEMPLATE = """
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-user_question = st.text_area("사례나 분석 데이터를 입력하세요 (예: 알레르기 원료 구분 보관 위반 시 처벌...):", height=150)
+user_question = st.text_area("사례나 분석 데이터를 편하게 입력하세요 (예: 라벨 안 붙이고 원액 팔면 어떻게 돼?):", height=150)
 
 if st.button("분석 실행", type="primary"):
     if not pre_uploaded_files:
-        st.warning("⚠️ 학습할 문서가 없습니다.")
+        st.warning("⚠️ 학습할 문서(PDF, Excel)가 없습니다.")
         st.stop()
     elif not user_question.strip():
         st.warning("⚠️ 질문을 입력해주세요.")
@@ -109,24 +118,30 @@ if st.button("분석 실행", type="primary"):
                 llm_fast = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
                 llm_stream = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0, streaming=True)
 
-                status.update(label="🔍 1단계: 원본 법령 조항 탐색 중...", state="running")
-                docs_pass_1 = retriever.invoke(user_question + " 위반 행위 조항")
+                # 💡 0단계: 질문 번역기 실행
+                status.update(label="🔍 0단계: 구어체 질문을 법률 용어로 번역 중...", state="running")
+                translator_chain = PromptTemplate.from_template(TRANSLATOR_TEMPLATE) | llm_fast | StrOutputParser()
+                legal_keywords = translator_chain.invoke({"question": user_question})
+                st.write(f"✔️ 번역된 법률 키워드: **{legal_keywords.strip()}**")
+
+                # 💡 1단계: 번역된 키워드로 원본 법령 검색
+                status.update(label="🔍 1단계: 번역된 키워드로 관련 법령 탐색 중...", state="running")
+                docs_pass_1 = retriever.invoke(legal_keywords + " 위반 행위 조항 식품위생법")
                 
-                # 💡 [핵심 튜닝]: 조항을 찾아내는 미니 에이전트의 '엄격성' 대폭 강화 (동문서답 원천 차단)
                 extraction_prompt = PromptTemplate.from_template(
-                    "사용자 질문: {question}\n\n문서: {context}\n\n"
-                    "당신은 엄격한 판사입니다. 위 문서에서 사용자 질문의 위반 행위(보관, 제조, 표시 등 행위의 본질)와 정확히 일치하는 '법령 조항 번호(예: 법 제3조)'를 추출하십시오.\n"
-                    "주의: 질문은 '보관'에 대한 것인데 문서는 '표시(라벨)'에 대한 내용인 것처럼 맥락이 불일치한다면 절대 억지로 추출하지 말고 정직하게 '확인 불가'라고만 출력하십시오."
+                    "사용자의 상황: {question}\n\n문서: {context}\n\n"
+                    "당신은 엄격한 판사입니다. 위 문서에서 사용자 상황의 위반 행위 본질과 정확히 일치하는 '법령 조항 번호(예: 제3조)'를 추출하십시오.\n"
+                    "절대 억지로 추출하지 말고, 맥락이 맞지 않으면 '확인 불가'라고 출력하십시오."
                 )
                 extraction_chain = extraction_prompt | llm_fast | StrOutputParser()
-                article_number = extraction_chain.invoke({"question": user_question, "context": format_docs(docs_pass_1)})
+                article_number = extraction_chain.invoke({"question": legal_keywords, "context": format_docs(docs_pass_1)})
                 st.write(f"✔️ 1단계: 위반 조항 탐지 완료 ({article_number})")
 
-                status.update(label=f"🔍 2단계: {article_number} 기반 원본 [별표] 처분표 추적 중...", state="running")
-                docs_pass_2 = retriever.invoke(f"{article_number} 별표 행정처분 과태료 기준표")
+                # 💡 2단계: 조항 기반 별표 추적
+                status.update(label=f"🔍 2단계: '{article_number}' 기반 원본 [별표] 처분표 추적 중...", state="running")
+                docs_pass_2 = retriever.invoke(f"{article_number} {legal_keywords} 별표 행정처분 과태료 기준표")
                 st.write("✔️ 2단계: 처분 기준표 데이터 확보 완료")
 
-                # 문서 중복 제거 및 병합
                 combined_docs = docs_pass_1 + docs_pass_2
                 unique_contents = {doc.page_content: doc for doc in combined_docs}.values()
                 final_context = "\n\n".join(doc.page_content for doc in unique_contents)
