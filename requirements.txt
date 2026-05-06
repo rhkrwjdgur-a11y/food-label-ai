@@ -4,6 +4,7 @@ langchain-google-genai==2.0.0
 langchain-community==0.3.0
 langchain-text-splitters==0.3.0
 faiss-cpu==1.8.0
-pdfplumber
+pypdf==4.3.1
 pandas==2.2.2
 openpyxl==3.1.5
+sentence-transformers==3.0.1
