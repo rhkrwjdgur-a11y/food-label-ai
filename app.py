@@ -16,7 +16,7 @@ st.set_page_config(page_title="AI 식품 표시사항 검토 시스템", page_ic
 st.title("🥛 연세유업 AI 식품 표시사항 및 행정처분 검토 시스템")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(🔍 **Query Translator 탑재**: 구어체 질문을 법률 용어로 자동 번역하여 원본 법령을 다중 추론합니다.)
+(🔍 **Universal Query Translator 탑재**: 구어체 질문의 본질을 꿰뚫어 원본 법령을 다중 추론합니다.)
 """)
 
 try:
@@ -25,7 +25,7 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 💡 원본 판독 전용 DB (요약본 텍스트 배제) ---
+# --- 💡 원본 판독 전용 DB ---
 pre_uploaded_files = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls")
 DB_PATH = "faiss_index_db_raw_v2" 
 
@@ -59,19 +59,18 @@ def load_and_index_documents(_file_list):
     progress_bar.empty()
     return vectorstore
 
-# --- 💡 0단계: 질문 번역기(Query Translator) 프롬프트 ---
+# --- 💡 0단계: 범용 질문 번역기 (Over-prompting 제거) ---
 TRANSLATOR_TEMPLATE = """
 당신은 대한민국 최고의 식품위생법 및 식품표시광고법 전문 변호사입니다.
-사용자의 일상적인 구어체 현장 용어를 법전(시행령, 시행규칙, 행정처분 별표)에서 정확히 매칭될 수 있는 '공식 법률 용어'로 번역하십시오.
+사용자의 일상적인 구어체 현장 용어의 '본질'을 파악하여, 법전(시행령/시행규칙/별표)에서 정확히 검색될 수 있는 '공식 법률 용어(키워드)'로 번역하십시오.
 
-[번역 예시]
-- 일상어: "라벨 안 붙이고 원액 팔았어", "탱크로리 라벨 없음" -> 법률어: "무표시 제품 판매, 표시사항 전부 미표시"
-- 일상어: "알레르기 원료 따로 보관 안함" -> 법률어: "위생적 취급기준 위반, 교차오염 방지 분리 보관 미흡"
-- 일상어: "위생복 안 입음" -> 법률어: "위생복 미착용, 위생적 취급기준 위반"
-- 일상어: "유통기한 지난 거 씀" -> 법률어: "소비기한 경과 제품 사용 및 보관"
+💡 [번역 원칙]
+1. 분석: 사용자가 말하는 행위의 '대상(포장지, 작업장, 원료, 종사자 서류 등)'과 '상태(안 함, 섞임, 기한 지남 등)'를 분석하십시오.
+2. 통찰: 표면적인 단어(예: 알레르기, 유기농, 탱크로리 등)에 현혹되지 말고, 이 행위가 법적으로 '표시 위반'인지, '위생적 취급 위반'인지, '기준규격 위반'인지 본질을 꿰뚫으십시오.
+3. 출력: 구구절절한 설명은 다 버리고, 행정처분 기준표에 등장할 법한 차갑고 명확한 법률 명사형 키워드 3~5개만 쉼표로 구분하여 출력하십시오.
 
 사용자 질문: {question}
-번역된 법률 키워드 (단어 위주로 3~5개 나열):
+번역된 법률 키워드:
 """
 
 # --- 최종 답변 작성 프롬프트 ---
@@ -96,7 +95,7 @@ TEMPLATE = """
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-user_question = st.text_area("사례나 분석 데이터를 편하게 입력하세요 (예: 라벨 안 붙이고 원액 팔면 어떻게 돼?):", height=150)
+user_question = st.text_area("사례나 분석 데이터를 편하게 입력하세요:", height=150)
 
 if st.button("분석 실행", type="primary"):
     if not pre_uploaded_files:
@@ -118,23 +117,23 @@ if st.button("분석 실행", type="primary"):
                 llm_fast = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
                 llm_stream = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0, streaming=True)
 
-                # 💡 0단계: 질문 번역기 실행
-                status.update(label="🔍 0단계: 구어체 질문을 법률 용어로 번역 중...", state="running")
+                # 💡 0단계: 범용적 질문 번역기 실행
+                status.update(label="🔍 0단계: 구어체 질문을 범용 법률 용어로 번역 중...", state="running")
                 translator_chain = PromptTemplate.from_template(TRANSLATOR_TEMPLATE) | llm_fast | StrOutputParser()
                 legal_keywords = translator_chain.invoke({"question": user_question})
                 st.write(f"✔️ 번역된 법률 키워드: **{legal_keywords.strip()}**")
 
                 # 💡 1단계: 번역된 키워드로 원본 법령 검색
                 status.update(label="🔍 1단계: 번역된 키워드로 관련 법령 탐색 중...", state="running")
-                docs_pass_1 = retriever.invoke(legal_keywords + " 위반 행위 조항 식품위생법")
+                docs_pass_1 = retriever.invoke(legal_keywords + " 위반 행위 조항")
                 
                 extraction_prompt = PromptTemplate.from_template(
-                    "사용자의 상황: {question}\n\n문서: {context}\n\n"
+                    "사용자의 원본 질문: {question}\n\n문서: {context}\n\n"
                     "당신은 엄격한 판사입니다. 위 문서에서 사용자 상황의 위반 행위 본질과 정확히 일치하는 '법령 조항 번호(예: 제3조)'를 추출하십시오.\n"
                     "절대 억지로 추출하지 말고, 맥락이 맞지 않으면 '확인 불가'라고 출력하십시오."
                 )
                 extraction_chain = extraction_prompt | llm_fast | StrOutputParser()
-                article_number = extraction_chain.invoke({"question": legal_keywords, "context": format_docs(docs_pass_1)})
+                article_number = extraction_chain.invoke({"question": user_question, "context": format_docs(docs_pass_1)})
                 st.write(f"✔️ 1단계: 위반 조항 탐지 완료 ({article_number})")
 
                 # 💡 2단계: 조항 기반 별표 추적
