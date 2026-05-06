@@ -26,7 +26,6 @@ except KeyError:
     st.stop()
 
 # --- 💡 세션 상태(Session State) 초기화 ---
-# 두 단계로 나누어 처리하기 위해 상태를 기억합니다.
 if 'phase' not in st.session_state:
     st.session_state.phase = 1
 if 'legal_options' not in st.session_state:
@@ -64,7 +63,6 @@ def load_and_index_documents(_file_list):
     return vectorstore
 
 # --- 💡 프롬프트 정의 ---
-# 1. 쟁점 제안 프롬프트
 OPTIONS_TEMPLATE = """
 당신은 수석 식품 법무 검토관입니다.
 사용자의 일상적인 구어체 질문을 분석하여, 어떤 법률 관점을 적용하느냐에 따라 달라질 수 있는 '3가지 다른 법률적 해석(방향)'을 제안하십시오.
@@ -78,7 +76,6 @@ OPTIONS_TEMPLATE = """
 사용자 질문: {question}
 """
 
-# 2. 최종 답변 작성 프롬프트
 TEMPLATE = """
 당신은 연세유업의 최고 권위 식품법령 및 품질관리 AI 비서입니다.
 사용자의 최초 질문과, 사용자가 직접 선택한 **[분석 방향 키워드]**를 바탕으로 제공된 [참조 문서]를 분석하여 답변하십시오.
@@ -100,12 +97,15 @@ TEMPLATE = """
 {context}
 """
 
+# 💡 [누락되었던 핵심 함수 추가] 문서 청크를 텍스트로 묶어주는 함수
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
 # --- 💡 UI 구성 ---
 user_question = st.text_area("사례나 분석 데이터를 편하게 입력하세요:", height=100)
 
 col1, col2 = st.columns([1, 5])
 with col1:
-    # 1단계 버튼: 질문을 분석하여 옵션 생성
     if st.button("🔍 1단계: 쟁점 분석", type="primary"):
         if not user_question.strip():
             st.warning("질문을 입력해주세요.")
@@ -115,11 +115,9 @@ with col1:
                 options_chain = PromptTemplate.from_template(OPTIONS_TEMPLATE) | llm_fast | StrOutputParser()
                 raw_options = options_chain.invoke({"question": user_question})
                 
-                # 텍스트를 리스트로 파싱 (1. 2. 3. 을 기준으로 나눔)
                 st.session_state.legal_options = [opt.strip() for opt in raw_options.split('\n') if opt.strip() and opt[0].isdigit()]
                 st.session_state.phase = 2
 
-# 2단계 UI: 옵션 선택 및 최종 실행 (phase가 2일 때만 표시됨)
 if st.session_state.phase == 2 and st.session_state.legal_options:
     st.markdown("---")
     st.markdown("### 🎯 2단계: 분석 방향 선택")
@@ -135,8 +133,7 @@ if st.session_state.phase == 2 and st.session_state.legal_options:
                 llm_fast = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
                 llm_stream = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0, streaming=True)
 
-                status.update(label=f"🔍 1단계: '{selected_option}' 관련 법령 탐색 중...", state="running")
-                # 사용자가 선택한 구체적인 키워드로만 꽉 찬 검색을 수행
+                status.update(label=f"🔍 1단계: '{selected_option[:15]}...' 관련 법령 탐색 중...", state="running")
                 docs_pass_1 = retriever.invoke(selected_option + " 법령 조항")
                 
                 extraction_prompt = PromptTemplate.from_template(
@@ -160,7 +157,6 @@ if st.session_state.phase == 2 and st.session_state.legal_options:
             rag_chain = (
                 PromptTemplate.from_template(TEMPLATE) | llm_stream | StrOutputParser()
             )
-            # 스트리밍 출력
             st.write_stream(rag_chain.stream({
                 "context": final_context, 
                 "question": user_question, 
