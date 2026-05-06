@@ -42,19 +42,17 @@ def load_and_index_documents(_file_list):
     for i, file_path in enumerate(_file_list):
         progress_bar.progress((i + 1) / len(_file_list), text=f"[{i+1}/{len(_file_list)}] 📄 '{file_path}' 정독 중...")
         try:
-            # 마스터 요약 파일은 제외하고 오직 원본 법령 파일만 학습하도록 필터링 권장
             if file_path.lower().endswith('.pdf'):
                 documents.extend(PyPDFLoader(file_path).load())
             elif file_path.lower().endswith('.txt'):
                 documents.extend(TextLoader(file_path, encoding='utf-8').load())
             elif file_path.lower().endswith(('.xls', '.xlsx')):
                 df = pd.read_excel(file_path)
-                # 엑셀 표의 구조를 보존하기 위해 markdown 형식으로 변환하여 학습
                 documents.append(Document(page_content=df.to_markdown(index=False), metadata={"source": file_path}))
         except Exception as e:
             st.warning(f"⚠️ {file_path} 로딩 실패: {e}")
 
-    # 💡 [핵심 기술]: 문서를 1,000글자가 아닌 10,000글자(거대 청크) 단위로 잘라 표(Table) 구조가 박살나는 것을 방지
+    # 💡 [핵심 기술]: 문서를 10,000글자(거대 청크) 단위로 잘라 표(Table) 구조 보존
     splits = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=2000).split_documents(documents)
     if not documents or len(splits) == 0: return None
 
@@ -89,7 +87,7 @@ TEMPLATE = """
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-user_question = st.text_area("사례나 분석 데이터를 입력하세요 (예: 원액 한글 라벨 미표시 시 처벌...):", height=150)
+user_question = st.text_area("사례나 분석 데이터를 입력하세요 (예: 알레르기 원료 구분 보관 위반 시 처벌...):", height=150)
 
 if st.button("분석 실행", type="primary"):
     if not pre_uploaded_files:
@@ -103,7 +101,6 @@ if st.button("분석 실행", type="primary"):
             vector_db = load_and_index_documents(tuple(pre_uploaded_files))
             
             if vector_db:
-                # 💡 [핵심 기술]: Gemini의 거대한 뇌 용량을 믿고, 한 번에 80,000글자 이상을 가져와서 읽히도록 세팅
                 retriever = vector_db.as_retriever(
                     search_type="mmr", 
                     search_kwargs={"k": 8, "fetch_k": 30} 
@@ -115,8 +112,13 @@ if st.button("분석 실행", type="primary"):
                 status.update(label="🔍 1단계: 원본 법령 조항 탐색 중...", state="running")
                 docs_pass_1 = retriever.invoke(user_question + " 위반 행위 조항")
                 
-                # 조항을 찾아내는 미니 에이전트
-                extraction_chain = PromptTemplate.from_template("질문: {question}\n문서: {context}\n위반에 해당하는 정확한 '법령 조항 번호(예: 제3조)'만 추출. 없으면 '확인 불가'") | llm_fast | StrOutputParser()
+                # 💡 [핵심 튜닝]: 조항을 찾아내는 미니 에이전트의 '엄격성' 대폭 강화 (동문서답 원천 차단)
+                extraction_prompt = PromptTemplate.from_template(
+                    "사용자 질문: {question}\n\n문서: {context}\n\n"
+                    "당신은 엄격한 판사입니다. 위 문서에서 사용자 질문의 위반 행위(보관, 제조, 표시 등 행위의 본질)와 정확히 일치하는 '법령 조항 번호(예: 법 제3조)'를 추출하십시오.\n"
+                    "주의: 질문은 '보관'에 대한 것인데 문서는 '표시(라벨)'에 대한 내용인 것처럼 맥락이 불일치한다면 절대 억지로 추출하지 말고 정직하게 '확인 불가'라고만 출력하십시오."
+                )
+                extraction_chain = extraction_prompt | llm_fast | StrOutputParser()
                 article_number = extraction_chain.invoke({"question": user_question, "context": format_docs(docs_pass_1)})
                 st.write(f"✔️ 1단계: 위반 조항 탐지 완료 ({article_number})")
 
