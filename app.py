@@ -19,7 +19,7 @@ except KeyError:
     st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
-# --- 💡 세션 상태(Session State) 초기화 ---
+# --- 💡 세션 상태 초기화 ---
 if 'phase' not in st.session_state:
     st.session_state.phase = 1
 if 'keyword_options' not in st.session_state:
@@ -29,24 +29,26 @@ if 'direction_options' not in st.session_state:
 if 'excel_data' not in st.session_state:
     st.session_state.excel_data = ""
 
-# --- 💡 엑셀(CSV) DB 통째로 로딩 ---
+# --- 💡 엑셀(.xlsx) DB 통째로 로딩 ---
 @st.cache_data
-def load_all_csv_data():
-    csv_files = glob.glob("*.csv")
-    if not csv_files:
-        return "⚠️ 로딩된 CSV 데이터 파일이 없습니다. 앱 폴더에 변환된 csv 파일들을 넣어주세요."
+def load_all_excel_data():
+    # 이제 csv가 아니라 xlsx 파일을 찾습니다!
+    excel_files = glob.glob("*.xlsx")
+    if not excel_files:
+        return "⚠️ 로딩된 엑셀 데이터 파일이 없습니다. 깃허브에 .xlsx 파일이 있는지 확인해주세요."
     
     combined_text = "==== [연세유업 마스터 법령/처분/과태료 데이터베이스] ====\n\n"
-    for file in csv_files:
+    for file in excel_files:
         try:
-            df = pd.read_csv(file)
+            # pd.read_excel 로 엑셀 파일을 읽습니다.
+            df = pd.read_excel(file)
             combined_text += f"\n--- [문서: {file}] ---\n"
             combined_text += df.to_markdown(index=False) + "\n\n"
         except Exception as e:
             st.error(f"⚠️ {file} 읽기 실패: {e}")
     return combined_text
 
-st.session_state.excel_data = load_all_csv_data()
+st.session_state.excel_data = load_all_excel_data()
 
 # --- 💡 프롬프트 정의 ---
 KEYWORD_TEMPLATE = """
@@ -74,7 +76,7 @@ DIRECTION_TEMPLATE = """
 
 TEMPLATE = """
 당신은 연세유업의 최고 권위 식품/축산물 법령 AI 비서입니다.
-사용자의 질문, 선택한 [키워드], [법률 방향]을 반영하여, 아래 제공된 [마스터 데이터베이스(CSV 결합본)]에서 '정확히 일치하는 위반 행위와 처분 결과'를 찾아내십시오.
+사용자의 질문, 선택한 [키워드], [법률 방향]을 반영하여, 아래 제공된 [마스터 데이터베이스(엑셀 결합본)]에서 '정확히 일치하는 위반 행위와 처분 결과'를 찾아내십시오.
 
 🚨 [데이터 검색 최우선 규칙] 🚨
 1. 절대로 당신의 사전 지식으로 소설을 쓰지 마십시오. 오직 아래 제공된 [마스터 데이터베이스] 안에서만 찾으십시오.
