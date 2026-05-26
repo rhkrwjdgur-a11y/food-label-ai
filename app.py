@@ -10,7 +10,7 @@ st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템
 st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (Pro 버전)")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(👨‍⚖️ **Multi-step HITL 탑재**: [키워드] ➡️ [법률 방향] ➡️ **[세부 상황 좁히기]**를 실무자가 직접 선택하여 AI의 오답을 원천 차단합니다.)
+(👨‍⚖️ **Multi-step HITL 탑재**: [단어] ➡️ [법률 방향] ➡️ **[세부 상황 좁히기]**를 실무자가 직접 선택하여 AI의 오답을 원천 차단합니다.)
 """)
 
 try:
@@ -74,15 +74,16 @@ DIRECTION_TEMPLATE = """
 선택된 키워드: {selected_keyword}
 """
 
-# [NEW] 세부 상황(디테일) 추출 프롬프트
+# [NEW] 세부 상황(디테일) 추출 프롬프트 (무표시 강제 할당 기능 추가)
 CASE_TEMPLATE = """
 당신은 데이터베이스 분석 전문가입니다.
 사용자가 선택한 [법률 방향]을 바탕으로, 아래 제공된 [마스터 데이터베이스] 안에서 사용자가 정확한 상황을 선택할 수 있도록 '2~4가지 세부 위반행위(조건)'를 뽑아주십시오.
 
 🚨 [작성 규칙] 🚨
-1. 예를 들어 표시기준 위반이라면, 데이터베이스에 있는 "전부 미표시", "일부 미표시" 등을 각각 선택지로 나누어 제시하십시오.
-2. 절대 지어내지 말고, 데이터베이스의 '위반행위' 열에 적힌 내용을 바탕으로 요약해 주십시오.
-3. 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 텍스트만 출력하십시오.
+1. 사용자의 질문에 '무표시', '전부', '아예 없음' 등의 뉘앙스가 있다면, 데이터베이스에서 반드시 '표시사항 전부 미표시' 또는 '무표시'에 해당하는 행을 찾아 무조건 1번 선택지로 제시하십시오.
+2. 반대로 '일부'라는 뉘앙스가 있다면, 특정 항목(제품명, 원재료 등) 누락에 해당하는 조건들을 뽑아주십시오.
+3. 절대 지어내지 말고, 데이터베이스의 '위반행위' 열에 적힌 내용을 바탕으로 요약해 주십시오.
+4. 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 텍스트만 출력하십시오.
 
 [마스터 데이터베이스]:
 {excel_data}
@@ -100,7 +101,7 @@ TEMPLATE = """
 2. 데이터베이스에 명시된 1차, 2차, 3차 처분 및 과태료 액수를 단 하나도 빼놓지 말고 그대로 출력하십시오.
 
 💡 **[최종 출력 포맷: 마크다운 표(Table) 형식]** 💡
-결 결과를 줄글로 쓰지 말고, 반드시 아래의 표 양식으로만 출력하십시오.
+결과를 줄글로 쓰지 말고, 반드시 아래의 표 양식으로만 출력하십시오.
 
 | 구분 | 상세 검토 내용 |
 | :--- | :--- |
@@ -143,7 +144,7 @@ if st.session_state.phase >= 2 and st.session_state.keyword_options:
             st.session_state.direction_options = [opt.strip() for opt in (PromptTemplate.from_template(DIRECTION_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question, "selected_keyword": selected_kw}).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 3
 
-# 3단계 -> 4단계 진입 로직 추가
+# 3단계 -> 4단계 진입 로직
 if st.session_state.phase >= 3 and st.session_state.direction_options:
     st.markdown("### 🏛️ 3단계: 적용 법률 방향 선택")
     selected_dir = st.radio("적용할 법률 관점:", st.session_state.direction_options, key="dir_radio")
