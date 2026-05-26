@@ -16,7 +16,7 @@ st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템
 st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (Pro 마스터버전)")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(👨‍⚖️ **통합 검증 시스템**: 엑셀+PDF 동시 분석, 업종 필터링 적용, 구체적 단어 부재 시 포괄 조항 매칭, 3단계 자체 팩트체크(Pass 1/1.5/2) 탑재)
+(👨‍⚖️ **통합 검증 시스템**: 엑셀+PDF 교차 검증 및 3단계 자체 팩트체크를 거치며, 검증 과정은 숨김 처리되어 깔끔한 리포트만 제공됩니다.)
 """)
 
 try:
@@ -102,8 +102,8 @@ CASE_TEMPLATE = """
 
 🚨 [환각 원천 차단 및 업종/포괄적 매칭 규칙] 🚨
 1. 원문 100% 복사: DB에 없는 조항이나 문구를 단 한 글자라도 지어내면 안 됩니다.
-2. 🏢 [업종(Business Type) 철저 매칭]: 실무자가 [{business_type}]을(를) 지정했습니다. DB에서 위반행위를 찾을 때 반드시 해당 업종에 적용되는 처분 기준인지 확인하십시오. (예: 제조가공업을 선택했는데 식품접객업 처분을 가져오면 절대 안 됩니다.)
-3. ✨ [포괄적 위반 항목 최우선 탐색]: 구체적인 단어(예: 당알코올 주의문구)가 DB에 없을 경우, 엉뚱한 항목(예: 알레르기)을 가져오지 마십시오! 대신 "표시사항 전부 또는 일부 미표시" 등과 같이 가장 포괄적인 위반행위 텍스트를 1순위로 찾으십시오.
+2. 🏢 [업종(Business Type) 철저 매칭]: 실무자가 [{business_type}]을(를) 지정했습니다. DB에서 위반행위를 찾을 때 반드시 해당 업종에 적용되는 처분 기준인지 확인하십시오.
+3. ✨ [포괄적 위반 항목 최우선 탐색]: 구체적인 단어(예: 당알코올 주의문구)가 DB에 없을 경우, 엉뚱한 항목을 가져오지 마십시오! 대신 "표시사항 전부 또는 일부 미표시", "그 밖의 표시사항 미표시" 등과 같이 가장 포괄적인 위반행위 텍스트를 1순위로 찾으십시오.
 4. 실무자 지정 구역 최우선: 4단계에서 지정한 [{selected_category}]에 해당하는 범위 안에서만 찾으십시오.
 5. 억지 매칭 금지: 관련 항목이 도저히 없다면 반드시 "⚠️ DB에서 관련 항목을 찾을 수 없습니다"라고만 출력하십시오.
 6. 부연 설명 없이 숫자 1, 2, 3으로 시작하십시오.
@@ -117,24 +117,25 @@ CASE_TEMPLATE = """
 강제 지정된 위반 구역: {selected_category}
 """
 
+# [NEW] 최종 출력 분리를 위한 프롬프트 수정
 TEMPLATE = """
 당신은 연세유업의 데이터베이스 통합 추출(엑셀 VLOOKUP + PDF 검색) 전담 AI입니다.
-실무자가 5단계에서 최종 선택한 **[세부 위반 상황]**을 [마스터 통합 데이터베이스]에서 찾아내고, 오직 그 줄(Row)이나 문단에 적혀있는 정보만 사용하여 리포트를 작성하십시오.
+실무자가 5단계에서 최종 선택한 **[세부 위반 상황]**을 [마스터 통합 데이터베이스]에서 찾아내 리포트를 작성하십시오.
 
 🚨 [최종 리포트 도출 3단계 검증 프로세스] 🚨
-당신의 뇌피셜(소설)을 막기 위해, 리포트 표를 그리기 전에 반드시 아래의 'Pass 1'과 'Pass 1.5'의 사고 과정을 화면에 먼저 출력하십시오.
+당신의 뇌피셜(소설)을 막기 위해, 반드시 아래의 'Pass 1'과 'Pass 1.5'의 사고 과정을 화면에 먼저 출력하십시오.
 
-▶ **[Pass 1: 원문 추출 (검색)]**
-데이터베이스(엑셀 또는 PDF)에서 '{selected_case}'와 가장 잘 일치하는 행(Row)이나 법령 문단을 찾아, 그 텍스트 전체를 복사하여 적으십시오.
+▶ **[Pass 1: 원문 교차 추출 (PDF + 엑셀 강제 동시 검색)]**
+1. 데이터베이스(엑셀 또는 PDF)에서 '{selected_case}'와 가장 잘 일치하는 원문을 찾아 복사하십시오.
+2. ⚠️ [강제 교차 검색 규칙]: 만약 찾은 원문이 PDF 법령 내용이라서 구체적인 '행정처분(품목제조정지 등)'이나 '과태료 금액'이 없다면, 반드시 지정된 업종({business_type})의 **엑셀 데이터베이스**를 추가로 스캔하여 처분 기준 행(Row)을 찾아 덧붙이십시오.
 
 ▶ **[Pass 1.5: 데이터 자체 검증 (팩트 체크)]**
-Pass 1에서 찾은 원문 텍스트 안에 '관련 법령/조항 번호', '처분 수위(1,2,3차)', '과태료'가 구체적으로 적혀있는지 분석하십시오. (원문에 숫자가 적혀있지 않으면 무조건 '해당 없음'으로 판정하고 절대 지어내지 마십시오.)
+Pass 1에서 확보한 (법령 내용 + 엑셀 처분 기준) 텍스트에 '관련 법령/조항', '처분 수위(1,2,3차)', '과태료'가 존재하는지 확인하십시오. (숫자가 없으면 '해당 없음' 판정)
+
+---FINAL_REPORT---
 
 ▶ **[Pass 2: 최종 리포트 도출 (출력)]**
-검증된 '팩트'만을 사용하여 아래 마크다운 표를 완성하십시오. (표 안에는 데이터베이스 원문에 없는 말을 절대 추가하지 마십시오)
-
-💡 **[최종 출력 포맷]** 💡
-(반드시 Pass 1과 Pass 1.5를 텍스트로 보여준 뒤, 아래 표를 그리십시오.)
+위의 "---FINAL_REPORT---" 구분선 아래에는, 오직 검증된 '팩트'만을 사용하여 아래 마크다운 표를 완성하십시오. (지어내기 절대 금지)
 
 | 구분 | 상세 검토 내용 |
 | :--- | :--- |
@@ -142,13 +143,14 @@ Pass 1에서 찾은 원문 텍스트 안에 '관련 법령/조항 번호', '처�
 | **2. 관련 법령 및 조항** | (Pass 1.5에서 확인된 조항 번호, 없으면 '데이터베이스 표기 없음') |
 | **3. 행정처분 수위** | • **1차 처분:** [내용]<br>• **2차 처분:** [내용]<br>• **3차 처분:** [내용] (※ 없으면 '해당 없음') |
 | **4. 과태료 및 과징금** | (Pass 1.5에서 확인된 액수, 없으면 '해당 없음') |
-| **5. 품질관리 가이드** | 1. (위반 사항을 예방하기 위한 실무 대처 방안 1)<br>2. (실무 대처 방안 2)<br>3. (실무 대처 방안 3) |
+| **5. 품질관리 가이드** | 1. (대처 방안 1)<br>2. (대처 방안 2)<br>3. (대처 방안 3) |
 
 [마스터 통합 데이터베이스]:
 {db_data}
 
 ---
 사용자 질문: {question}
+강제 지정된 업종: {business_type}
 선택된 위반 구역: {selected_category}
 실무자가 찾은 원문(위반 상황): {selected_case}
 """
@@ -190,7 +192,6 @@ if st.session_state.phase >= 4:
     st.markdown("### 🗂️ 4단계: 업종 및 위반 구역(표시 유형) 강제 지정")
     st.info("💡 AI가 엉뚱한 업종이나 구역을 뒤지지 않도록 실무자가 직접 타겟을 고정해주세요.")
     
-    # [NEW] 업종 선택 UI 추가
     st.markdown("#### ① 해당 업종 선택")
     biz_choices = [
         "🏢 식품제조·가공업 (연세유업 등 일반 제조)",
@@ -217,7 +218,7 @@ if st.session_state.phase >= 4:
                 "db_data": st.session_state.db_data,
                 "question": user_question,
                 "selected_direction": selected_dir,
-                "business_type": selected_biz,       # [NEW] 업종 데이터 전달
+                "business_type": selected_biz,
                 "selected_category": selected_cat
             }).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 5
@@ -228,16 +229,33 @@ if st.session_state.phase == 5 and st.session_state.case_options:
     st.info("💡 타겟으로 지정하신 업종에 해당하는 처분기준표/문서 원문입니다.")
     selected_case = st.radio("정확한 위반 상황:", st.session_state.case_options, key="case_radio")
 
-    if st.button("🚀 최종 리포트 생성 (Pass 1/1.5/2 자기검증)", type="primary"):
-        with st.status("원본 팩트 체크 및 3단계 자체 검증 중...", expanded=True) as status:
-            llm_stream = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0, streaming=True)
-            rag_chain = PromptTemplate.from_template(TEMPLATE) | llm_stream | StrOutputParser()
-            status.update(label="✅ 통합 검증 완료. 리포트를 출력합니다.", state="complete")
+    # [NEW] UI 깔끔 분리 로직 (스트리밍 대신 invoke 사용 + expander 적용)
+    if st.button("🚀 최종 리포트 생성", type="primary"):
+        with st.spinner("원본 교차 검증(PDF+엑셀) 및 3단계 자체 팩트 체크 중... (수 초 정도 소요됩니다)"):
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
+            rag_chain = PromptTemplate.from_template(TEMPLATE) | llm | StrOutputParser()
+            
+            # 답변을 한 번에 받아옵니다.
+            full_response = rag_chain.invoke({
+                "db_data": st.session_state.db_data,
+                "question": user_question, 
+                "business_type": selected_biz,
+                "selected_category": selected_cat,
+                "selected_case": selected_case
+            })
             
         st.markdown("### 📊 최종 분석 결과 리포트")
-        st.write_stream(rag_chain.stream({
-            "db_data": st.session_state.db_data,
-            "question": user_question, 
-            "selected_category": selected_cat,
-            "selected_case": selected_case
-        }))
+        
+        # ---FINAL_REPORT--- 구분선을 기준으로 답변을 두 동강 냅니다.
+        if "---FINAL_REPORT---" in full_response:
+            reasoning_part, report_part = full_response.split("---FINAL_REPORT---", 1)
+            
+            # Pass 1, 1.5는 접어두기(expander) 상자 안에 넣습니다.
+            with st.expander("🕵️‍♂️ AI 자체 검증 과정 (Pass 1 & 1.5) - 클릭하여 펼쳐보기"):
+                st.markdown(reasoning_part.strip())
+                
+            # Pass 2 표는 바깥에 깔끔하게 출력합니다.
+            st.markdown(report_part.strip())
+        else:
+            # 혹시라도 AI가 구분선을 빼먹었을 경우를 대비한 안전 장치
+            st.markdown(full_response)
