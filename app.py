@@ -10,7 +10,7 @@ st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템
 st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (5단계 Pro)")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(👨‍⚖️ **범용 5-Step HITL 탑재**: AI가 단어(예: 당알코올)에 낚이지 않도록 실무자가 구역을 지정하고, AI는 문맥(본질)을 파악해 엑셀 원문을 매칭합니다.)
+(👨‍⚖️ **범용 5-Step HITL 탑재**: AI가 단어(예: 당알코올)에 낚이지 않도록 실무자가 구역을 지정하고, 최종 결과는 엑셀 원문을 100% 그대로 VLOOKUP 하여 환각을 원천 차단합니다.)
 """)
 
 try:
@@ -95,12 +95,13 @@ CASE_TEMPLATE = """
 """
 
 TEMPLATE = """
-당신은 연세유업의 최고 권위 식품/축산물 법령 AI 비서입니다.
-사용자의 질문과 가장 중요한 **[세부 위반 상황(의사결정 결과)]**을 완벽히 반영하여, 아래 제공된 [마스터 데이터베이스]에서 '정확히 일치하는 단 하나의 행(Row)'을 찾아내십시오.
+당신은 연세유업의 데이터베이스 추출(VLOOKUP) 전담 AI입니다.
+실무자가 5단계에서 최종 선택한 **[세부 위반 상황]** 텍스트를 [마스터 데이터베이스]에서 찾아내고, 오직 그 줄(Row)에 적혀있는 처분 정보만 100% 그대로 복사하여 리포트를 작성하십시오.
 
-🚨 [데이터 검색 최우선 규칙] 🚨
-1. 사용자가 선택한 [세부 위반 상황]과 100% 일치하는 처분 기준을 찾아내십시오.
-2. 데이터베이스에 명시된 1차, 2차, 3차 처분 및 과태료 액수를 단 하나도 빼놓지 말고 그대로 출력하십시오.
+🚨 [최종 리포트 작성 절대 규칙 (AI의 뇌피셜 원천 금지)] 🚨
+1. 엄격한 행(Row) 매칭: 실무자가 선택한 텍스트(예: "커. 표시기준 위반")를 데이터베이스에서 정확히 찾고, 반드시 그 옆 열(Column)에 적힌 '관련 법령'과 '1차, 2차, 3차 처분 수위'를 가져오십시오.
+2. 소설 작성 절대 금지: 데이터베이스(엑셀 원문)에 없는 조항 번호(예: 제42조 등)나 처분 액수를 단 1원이라도 당신의 기억에서 꺼내어 지어내면 절대 안 됩니다.
+3. 빈칸 처리: 만약 데이터베이스의 해당 줄에서 처분 수위나 조항을 도저히 찾을 수 없다면, 억지로 지어내지 말고 "데이터베이스 표기 없음"이라고 출력하십시오.
 
 💡 **[최종 출력 포맷: 마크다운 표(Table) 형식]** 💡
 결과를 줄글로 쓰지 말고, 반드시 아래의 표 양식으로만 출력하십시오.
@@ -108,7 +109,7 @@ TEMPLATE = """
 | 구분 | 상세 검토 내용 |
 | :--- | :--- |
 | **1. 위반 의심 사항** | (질문 요약 및 어떤 행위가 위반인지 명확히 기재) |
-| **2. 관련 법령 및 조항** | (데이터베이스에서 찾은 정확한 조항 번호) |
+| **2. 관련 법령 및 조항** | (데이터베이스에서 찾은 정확한 조항 번호, 없으면 '데이터베이스 표기 없음') |
 | **3. 행정처분 수위** | • **1차 처분:** [내용]<br>• **2차 처분:** [내용]<br>• **3차 처분:** [내용] |
 | **4. 과태료 및 과징금** | (데이터베이스에 명시된 과태료/과징금 액수, 없으면 '해당 없음') |
 | **5. 품질관리 가이드** | 1. (대처 방안 1)<br>2. (대처 방안 2)<br>3. (대처 방안 3) |
@@ -119,7 +120,7 @@ TEMPLATE = """
 ---
 사용자 질문: {question}
 선택된 위반 구역: {selected_category}
-선택된 세부 위반 상황: {selected_case}
+실무자가 찾은 엑셀 원문(위반 상황): {selected_case}
 """
 
 # --- 💡 UI 구성 ---
@@ -134,6 +135,7 @@ with col1:
                 st.session_state.keyword_options = [opt.strip() for opt in (PromptTemplate.from_template(KEYWORD_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question}).split('\n') if opt.strip() and opt[0].isdigit()]
                 st.session_state.phase = 2
 
+# 2단계
 if st.session_state.phase >= 2 and st.session_state.keyword_options:
     st.markdown("### 🎯 2단계: 법률 키워드(단어) 선택")
     selected_kw = st.radio("적용할 핵심 키워드:", st.session_state.keyword_options, key="kw_radio")
@@ -144,10 +146,17 @@ if st.session_state.phase >= 2 and st.session_state.keyword_options:
             st.session_state.direction_options = [opt.strip() for opt in (PromptTemplate.from_template(DIRECTION_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question, "selected_keyword": selected_kw}).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 3
 
+# 3단계
 if st.session_state.phase >= 3 and st.session_state.direction_options:
     st.markdown("### 🏛️ 3단계: 적용 법률 방향 선택")
     selected_dir = st.radio("적용할 법률 관점:", st.session_state.direction_options, key="dir_radio")
     
+    # 💡 3단계에서 4단계로 진입하는 명확한 버튼 유지
+    if st.button("➡️ 4단계: 위반 구역 지정하기", type="secondary"):
+        st.session_state.phase = 4
+
+# 4단계
+if st.session_state.phase >= 4:
     st.markdown("---")
     st.markdown("### 🗂️ 4단계: 위반 구역(표시 유형) 강제 지정")
     st.info("💡 AI가 엉뚱한 구역(예: 영양성분)을 뒤지지 않도록 실무자가 직접 카테고리를 고정해주세요.")
@@ -170,18 +179,20 @@ if st.session_state.phase >= 3 and st.session_state.direction_options:
                 "selected_direction": selected_dir,
                 "selected_category": selected_cat
             }).split('\n') if opt.strip() and opt[0].isdigit()]
-            st.session_state.phase = 4
+            st.session_state.phase = 5
 
-if st.session_state.phase == 4 and st.session_state.case_options:
+# 5단계
+if st.session_state.phase == 5 and st.session_state.case_options:
     st.markdown("### 📋 5단계: 세부 위반 상황 선택 (엑셀 원문 확인)")
     st.info("💡 실무자님이 지정하신 구역에 해당하는 엑셀 DB 원문입니다.")
     selected_case = st.radio("정확한 위반 상황:", st.session_state.case_options, key="case_radio")
 
     if st.button("🚀 최종 리포트 생성", type="primary"):
-        with st.status("최종 마스터 리포트 작성 중...", expanded=True) as status:
+        with st.status("엑셀 원문 VLOOKUP 매칭 및 리포트 작성 중...", expanded=True) as status:
+            # 환각 방지를 위해 temperature=0 고정
             llm_stream = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0, streaming=True)
             rag_chain = PromptTemplate.from_template(TEMPLATE) | llm_stream | StrOutputParser()
-            status.update(label="✅ 분석 완료. 리포트를 출력합니다.", state="complete")
+            status.update(label="✅ 분석 완료. 엑셀 원본 데이터를 기반으로 리포트를 출력합니다.", state="complete")
             
         st.markdown("### 📊 최종 분석 결과 리포트")
         st.write_stream(rag_chain.stream({
