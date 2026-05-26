@@ -10,7 +10,7 @@ st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템
 st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (5단계 Pro)")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(👨‍⚖️ **5-Step HITL 탑재**: AI의 헛발질(예: 당알코올을 영양성분으로 착각)을 막기 위해 실무자가 위반 구역을 강제로 지정합니다.)
+(👨‍⚖️ **범용 5-Step HITL 탑재**: AI가 단어(예: 당알코올)에 낚이지 않도록 실무자가 구역을 지정하고, AI는 문맥(본질)을 파악해 엑셀 원문을 매칭합니다.)
 """)
 
 try:
@@ -36,7 +36,7 @@ if 'excel_data' not in st.session_state:
 def load_all_excel_data():
     excel_files = glob.glob("*.xlsx")
     if not excel_files:
-        return "⚠️ 로딩된 엑셀 데이터 파일이 없습니다. 깃허브에 .xlsx 파일이 있는지 확인해주세요."
+        return "⚠️ 로딩된 엑셀 데이터 파일이 없습니다. 앱 폴더에 .xlsx 파일이 있는지 확인해주세요."
     
     combined_text = "==== [연세유업 마스터 법령/처분/과태료 데이터베이스] ====\n\n"
     for file in excel_files:
@@ -63,25 +63,28 @@ DIRECTION_TEMPLATE = """
 당신은 수석 법무 검토관입니다.
 사용자의 질문과 선택된 '법률 키워드'를 결합하여, 이를 처벌할 수 있는 '3가지 법률 적용 방향(관점)'을 제안하십시오.
 
-🚨 [절대 준수 규칙] 🚨
-1. "제O조" 같은 구체적인 조항 번호는 절대로 지어내지 마십시오.
-2. 오직 법률의 이름과 어떤 관점인지 간략한 설명만 적으십시오.
-3. 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
+🚨 [절대 준수 규칙: 법률 관할의 엄격한 분리] 🚨
+1. [라벨/표시/광고]: 라벨 기재사항(제품명, 원재료, 주의문구, 영양성분 등) 누락, 오기재, 허위광고 이슈는 무조건 「식품표시광고법」 관점을 1순위로 제안하십시오. (이 경우 식품위생법 제안 금지)
+2. [위생/안전/이물]: 일반 식품은 「식품위생법」을 제안하되, 품목이 유제품/식육일 경우는 특별법인 「축산물 위생관리법」을 최우선으로 제안하십시오.
+3. [원산지]: 원재료의 국산/수입산 표기 누락 및 속임수는 특별법인 「농수산물의 원산지 표시에 관한 법률」 관점을 제안하십시오.
+4. "제O조" 같은 구체적인 조항 번호는 절대로 지어내지 마십시오.
+5. 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
 
 사용자 질문: {question}
 선택된 키워드: {selected_keyword}
 """
 
 CASE_TEMPLATE = """
-당신은 데이터베이스 쟁점 추출 전문가입니다.
-사용자의 질문과 실무자가 강제로 지정한 **[위반 구역(카테고리)]**을 바탕으로, [마스터 데이터베이스]에서 조건에 정확히 일치하는 위반행위 3~5개를 원문 그대로 추출하십시오.
+당신은 실무 현장의 용어를 법률/행정 처분 기준(데이터베이스)과 의미론적으로 연결(Semantic Mapping)하는 전문가입니다.
 
-🚨 [절대 준수 규칙] 🚨
-1. 실무자가 지정한 [위반 구역]을 최우선으로 따르십시오. 
-   - 실무자가 '소비자 안전 주의사항'을 골랐다면, 절대 '영양성분' 관련 엑셀 행(Row)을 추출하지 마십시오.
-   - 실무자가 '완전 무표시'를 골랐다면, '전부를 표시하지 않은 경우' 관련 행만 추출하십시오.
-2. 당신의 사전 지식을 쓰지 말고, 오직 [마스터 데이터베이스]의 '위반행위' 열 텍스트를 글자 하나 바꾸지 말고 그대로 복사하십시오.
-3. 부연 설명 없이 숫자 1, 2, 3으로 시작하는 텍스트만 출력하십시오.
+[목표]
+사용자의 구체적인 상황이 [마스터 데이터베이스]에 정확한 단어로 존재하지 않더라도, 법리적 맥락에서 가장 적합한(포괄하는) '위반행위' 항목을 3~5개 찾아 객관식으로 구성하십시오.
+
+🚨 [궁극의 범용 매칭 원칙] 🚨
+1. 단순 단어 매칭(Ctrl+F) 절대 금지: 사용자의 질문에 쓰인 특정 현장 단어가 엑셀에 없다고 엉뚱한 것을 가져오지 마십시오. 사용자의 상황이 '어떤 법적 의무'를 위반한 것인지 그 '본질(의미)'을 파악하십시오.
+2. 상위 개념(포괄적) 매칭: 구체적인 현장 용어는 엑셀의 넓은 상위 개념(예: '소비자 안전을 위한 주의사항 미표시', '표시기준 위반', '기타 표시사항 누락' 등)에 속하게 됩니다. 문맥상 가장 정확히 포괄하는 항목을 찾으십시오.
+3. 실무자 지정 구역 최우선: 실무자가 앞 단계에서 강제로 지정한 [위반 구역(카테고리)]의 성격에 맞는 엑셀 행(Row) 안에서만 찾으십시오.
+4. 당신의 사전 지식을 배제하고, 최종 선택지는 데이터베이스에 있는 원문을 글자 하나 바꾸지 말고 그대로 복사하여 출력하십시오. 부연 설명 없이 숫자 1, 2, 3으로 시작하십시오.
 
 [마스터 데이터베이스]:
 {excel_data}
@@ -131,7 +134,6 @@ with col1:
                 st.session_state.keyword_options = [opt.strip() for opt in (PromptTemplate.from_template(KEYWORD_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question}).split('\n') if opt.strip() and opt[0].isdigit()]
                 st.session_state.phase = 2
 
-# 2단계
 if st.session_state.phase >= 2 and st.session_state.keyword_options:
     st.markdown("### 🎯 2단계: 법률 키워드(단어) 선택")
     selected_kw = st.radio("적용할 핵심 키워드:", st.session_state.keyword_options, key="kw_radio")
@@ -142,26 +144,25 @@ if st.session_state.phase >= 2 and st.session_state.keyword_options:
             st.session_state.direction_options = [opt.strip() for opt in (PromptTemplate.from_template(DIRECTION_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question, "selected_keyword": selected_kw}).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 3
 
-# 3단계 및 4단계 (UI 병합 노출)
 if st.session_state.phase >= 3 and st.session_state.direction_options:
     st.markdown("### 🏛️ 3단계: 적용 법률 방향 선택")
     selected_dir = st.radio("적용할 법률 관점:", st.session_state.direction_options, key="dir_radio")
     
     st.markdown("---")
     st.markdown("### 🗂️ 4단계: 위반 구역(표시 유형) 강제 지정")
-    st.info("💡 AI가 당알코올(주의사항)과 영양성분을 헷갈리지 못하게 직접 구역을 고정해주세요.")
+    st.info("💡 AI가 엉뚱한 구역(예: 영양성분)을 뒤지지 않도록 실무자가 직접 카테고리를 고정해주세요.")
     
-    # 우리가 직접 만든 고정형 카테고리!
     category_choices = [
         "🛑 [소비자 안전 주의사항] 알레르기 주의문구, 당알코올 경고문 등 안전 목적의 문구 누락",
         "📋 [기본 표시/원재료] 제품명, 원재료명, 알레르기 유발물질(원료 자체) 등 일반 정보 누락",
         "📊 [영양표시] 영양정보표 박스 안의 수치(열량, 당류 등) 누락 및 표기 오류",
-        "⚠️ [완전 무표시] 라벨 자체를 아예 부착하지 않은 경우"
+        "⚠️ [완전 무표시] 라벨 자체를 아예 부착하지 않은 경우",
+        "기타 표시기준 위반"
     ]
     selected_cat = st.radio("위반 쟁점 분류:", category_choices, key="cat_radio")
 
     if st.button("🔎 5단계: 세부 위반조건 추출", type="secondary"):
-        with st.spinner("지정된 구역 안에서만 정확한 위반 케이스를 추출 중입니다..."):
+        with st.spinner("지정된 구역 안에서 법리적 맥락에 맞는 위반 케이스를 추출 중입니다..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
             st.session_state.case_options = [opt.strip() for opt in (PromptTemplate.from_template(CASE_TEMPLATE) | llm | StrOutputParser()).invoke({
                 "excel_data": st.session_state.excel_data,
@@ -171,10 +172,9 @@ if st.session_state.phase >= 3 and st.session_state.direction_options:
             }).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 4
 
-# 5단계 (최종 확인 및 리포트)
 if st.session_state.phase == 4 and st.session_state.case_options:
     st.markdown("### 📋 5단계: 세부 위반 상황 선택 (엑셀 원문 확인)")
-    st.info("💡 지정하신 구역에 해당하는 실제 엑셀 처분 기준들입니다.")
+    st.info("💡 실무자님이 지정하신 구역에 해당하는 엑셀 DB 원문입니다.")
     selected_case = st.radio("정확한 위반 상황:", st.session_state.case_options, key="case_radio")
 
     if st.button("🚀 최종 리포트 생성", type="primary"):
