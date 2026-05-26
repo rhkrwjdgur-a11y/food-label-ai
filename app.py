@@ -7,7 +7,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템", page_icon="🥛", layout="wide")
-st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (Pro 버전)")
+st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 ")
 st.markdown("""
 품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
 (👨‍⚖️ **의사결정 트리 탑재**: AI가 스스로 판단하지 않고, 핵심 쟁점(예: 전부 vs 일부)을 실무자에게 되물어 오답을 원천 차단합니다.)
