@@ -6,23 +6,24 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# PyPDF2 대신 회원님의 환경에 맞춘 최신 pypdf 사용
+# PyPDF2 대신 환경에 맞춘 최신 pypdf 사용
 try:
     from pypdf import PdfReader
 except ImportError:
     st.error("⚠️ pypdf 라이브러리가 설치되지 않았습니다. requirements.txt를 확인해주세요.")
 
-st.set_page_config(page_title="AI 식품/축산물 표시사항 검토 시스템", page_icon="🥛", layout="wide")
-st.title("🥛 연세유업 AI 식품/축산물 법령 검토 시스템 (Pro 마스터버전)")
+st.set_page_config(page_title="AI 식품/축산물 규제 검토 시스템", page_icon="🏢", layout="wide")
+
+# [UI 변경] 경영진 및 타 부서가 보아도 신뢰감을 주는 공식적인 타이틀과 설명
+st.title("🏢 연세유업 규제 및 행정처분 AI 검색 시스템")
 st.markdown("""
-품질안전부문 실무진을 위한 맞춤형 법률 및 규격 검토 도구입니다.
-(👨‍⚖️ **통합 검증 시스템**: 엑셀+PDF 교차 검증 및 3단계 자체 팩트체크를 거치며, 검증 과정은 숨김 처리되어 깔끔한 리포트만 제공됩니다.)
+**식품·축산물 관련 법령 및 행정처분 기준을 신속하고 정확하게 조회하기 위한 사내 AI 법무 검토 솔루션입니다.** *(※ 식약처 고시, 법령 원문(PDF) 및 사내 처분기준표(Excel)를 교차 검증하여 환각(오류) 없는 신뢰도 높은 리포트를 도출합니다.)*
 """)
 
 try:
     google_api_key = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
-    st.error("⚠️ 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
+    st.error("⚠️ 시스템 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
     st.stop()
 
 # --- 💡 세션 상태 초기화 ---
@@ -38,7 +39,7 @@ if 'db_data' not in st.session_state:
     st.session_state.db_data = ""
 
 # --- 💡 엑셀(.xlsx) + PDF 통합 DB 로딩 ---
-@st.cache_data(show_spinner="데이터베이스(엑셀+PDF)를 로딩 중입니다...")
+@st.cache_data(show_spinner="사내 데이터베이스(관련 법령 및 행정처분 기준표)를 동기화 중입니다...")
 def load_all_documents():
     combined_text = "==== [연세유업 마스터 통합 데이터베이스 (엑셀+PDF)] ====\n\n"
     
@@ -66,7 +67,7 @@ def load_all_documents():
             st.error(f"⚠️ {file} (PDF) 읽기 실패: {e}")
             
     if not excel_files and not pdf_files:
-        return "⚠️ 로딩된 데이터 파일이 없습니다. 앱 폴더에 .xlsx 또는 .pdf 파일을 넣어주세요."
+        return "⚠️ 로딩된 데이터 파일이 없습니다. 시스템 폴더에 .xlsx 또는 .pdf 파일을 업로드해 주십시오."
         
     return combined_text
 
@@ -117,7 +118,7 @@ CASE_TEMPLATE = """
 강제 지정된 위반 구역: {selected_category}
 """
 
-# [NEW] 최종 출력 분리를 위한 프롬프트 수정
+# [NEW] 최종 출력 분리를 위한 프롬프트
 TEMPLATE = """
 당신은 연세유업의 데이터베이스 통합 추출(엑셀 VLOOKUP + PDF 검색) 전담 AI입니다.
 실무자가 5단계에서 최종 선택한 **[세부 위반 상황]**을 [마스터 통합 데이터베이스]에서 찾아내 리포트를 작성하십시오.
@@ -143,7 +144,7 @@ Pass 1에서 확보한 (법령 내용 + 엑셀 처분 기준) 텍스트에 '관�
 | **2. 관련 법령 및 조항** | (Pass 1.5에서 확인된 조항 번호, 없으면 '데이터베이스 표기 없음') |
 | **3. 행정처분 수위** | • **1차 처분:** [내용]<br>• **2차 처분:** [내용]<br>• **3차 처분:** [내용] (※ 없으면 '해당 없음') |
 | **4. 과태료 및 과징금** | (Pass 1.5에서 확인된 액수, 없으면 '해당 없음') |
-| **5. 품질관리 가이드** | 1. (대처 방안 1)<br>2. (대처 방안 2)<br>3. (대처 방안 3) |
+| **5. 품질관리/대응 가이드** | 1. (대처 방안 1)<br>2. (대처 방안 2)<br>3. (대처 방안 3) |
 
 [마스터 통합 데이터베이스]:
 {db_data}
@@ -156,63 +157,64 @@ Pass 1에서 확보한 (법령 내용 + 엑셀 처분 기준) 텍스트에 '관�
 """
 
 # --- 💡 UI 구성 ---
-user_question = st.text_area("사례나 분석 데이터를 편하게 입력하세요:", height=100)
+# [UI 변경] 입력창 문구를 공식적으로 변경
+user_question = st.text_area("🔍 검토가 필요한 위반 의심 사례, 표시사항 누락 등 구체적인 상황을 입력해 주십시오:", height=100, placeholder="예시: 당알코올 10% 이상 제품에 '과량 섭취 시 설사를 일으킬 수 있습니다' 주의문구 누락 건에 대한 행정처분 기준 조회")
 
 col1, col2 = st.columns([1, 5])
 with col1:
-    if st.button("🔍 1단계: 핵심 단어 분석", type="primary"):
+    if st.button("▶ 1단계: 법률 키워드 추출", type="primary"):
         if user_question.strip():
-            with st.spinner("분석 중..."):
+            with st.spinner("AI가 상황을 분석하여 법률 키워드를 추출하고 있습니다..."):
                 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.2)
                 st.session_state.keyword_options = [opt.strip() for opt in (PromptTemplate.from_template(KEYWORD_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question}).split('\n') if opt.strip() and opt[0].isdigit()]
                 st.session_state.phase = 2
 
 # 2단계
 if st.session_state.phase >= 2 and st.session_state.keyword_options:
-    st.markdown("### 🎯 2단계: 법률 키워드(단어) 선택")
-    selected_kw = st.radio("적용할 핵심 키워드:", st.session_state.keyword_options, key="kw_radio")
+    st.markdown("### 🎯 2단계: 분석 대상 법률 키워드 선택")
+    selected_kw = st.radio("적용할 핵심 키워드 지정:", st.session_state.keyword_options, key="kw_radio")
     
-    if st.button("⚖️ 3단계: 법률 쟁점 분석", type="secondary"):
-        with st.spinner("분석 중..."):
+    if st.button("▶ 3단계: 법률 적용 관점 분석", type="secondary"):
+        with st.spinner("해당 키워드를 바탕으로 법률 쟁점을 분석 중입니다..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.2)
             st.session_state.direction_options = [opt.strip() for opt in (PromptTemplate.from_template(DIRECTION_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question, "selected_keyword": selected_kw}).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 3
 
 # 3단계
 if st.session_state.phase >= 3 and st.session_state.direction_options:
-    st.markdown("### 🏛️ 3단계: 적용 법률 방향 선택")
-    selected_dir = st.radio("적용할 법률 관점:", st.session_state.direction_options, key="dir_radio")
+    st.markdown("### 🏛️ 3단계: 검토 대상 법률 확정")
+    selected_dir = st.radio("검토를 진행할 법률 관점 지정:", st.session_state.direction_options, key="dir_radio")
     
-    if st.button("➡️ 4단계: 업종 및 위반 구역 지정하기", type="secondary"):
+    if st.button("▶ 4단계: 업종 및 위반 유형 지정", type="secondary"):
         st.session_state.phase = 4
 
 # 4단계
 if st.session_state.phase >= 4:
     st.markdown("---")
-    st.markdown("### 🗂️ 4단계: 업종 및 위반 구역(표시 유형) 강제 지정")
-    st.info("💡 AI가 엉뚱한 업종이나 구역을 뒤지지 않도록 실무자가 직접 타겟을 고정해주세요.")
+    st.markdown("### 🗂️ 4단계: 검색 대상 업종 및 위반 유형 고정")
+    st.info("💡 빠르고 정확한 행정처분 기준 조회를 위해, 대상 업종 및 위반 카테고리를 특정해 주십시오.")
     
-    st.markdown("#### ① 해당 업종 선택")
+    st.markdown("#### ① 대상 업종 선택")
     biz_choices = [
-        "🏢 식품제조·가공업 (연세유업 등 일반 제조)",
-        "🏪 즉석판매제조가공업 / 식품접객업 (소규모/매장 등)",
-        "🥩 축산물가공업 / 식육포장처리업 (유제품, 고기류)",
+        "🏢 식품제조·가공업 (일반 제조/가공)",
+        "🏪 즉석판매제조·가공업 / 식품접객업 (소규모/매장 판매 등)",
+        "🥩 축산물가공업 / 식육포장처리업 (유가공품, 식육 등)",
         "🌐 공통 적용 (업종 무관)"
     ]
-    selected_biz = st.radio("타겟 업종:", biz_choices, key="biz_radio")
+    selected_biz = st.radio("처분 대상 업종:", biz_choices, key="biz_radio")
 
-    st.markdown("#### ② 위반 쟁점 분류 선택")
+    st.markdown("#### ② 위반 쟁점 카테고리 선택")
     category_choices = [
-        "🛑 [소비자 안전 주의사항] 알레르기 주의문구, 당알코올 경고문 등 안전 목적의 문구 누락",
-        "📋 [기본 표시/원재료] 제품명, 원재료명, 알레르기 유발물질(원료 자체) 등 일반 정보 누락",
-        "📊 [영양표시] 영양정보표 박스 안의 수치(열량, 당류 등) 누락 및 표기 오류",
-        "⚠️ [완전 무표시] 라벨 자체를 아예 부착하지 않은 경우",
+        "🛑 [안전 주의사항] 알레르기 주의문구, 당알코올 경고문 등 안전/주의 표기 누락",
+        "📋 [기본 표시사항] 제품명, 원재료명 등 필수 일반 정보 누락 또는 오기재",
+        "📊 [영양 표시기준] 영양정보표 내 수치 누락 및 표기 오류",
+        "⚠️ [완전 무표시] 라벨을 부착하지 않고 유통/판매한 경우",
         "기타 표시기준 위반"
     ]
-    selected_cat = st.radio("위반 구역:", category_choices, key="cat_radio")
+    selected_cat = st.radio("위반 카테고리:", category_choices, key="cat_radio")
 
-    if st.button("🔎 5단계: 세부 위반조건 추출", type="secondary"):
-        with st.spinner("지정된 업종과 엑셀/PDF 문서를 동시에 스캔하여 원문을 추출 중입니다..."):
+    if st.button("▶ 5단계: 조항 및 처분기준 조회", type="secondary"):
+        with st.spinner("선택된 업종 및 카테고리에 해당하는 사내 DB(법령/처분기준표)를 검색 중입니다..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
             st.session_state.case_options = [opt.strip() for opt in (PromptTemplate.from_template(CASE_TEMPLATE) | llm | StrOutputParser()).invoke({
                 "db_data": st.session_state.db_data,
@@ -225,17 +227,16 @@ if st.session_state.phase >= 4:
 
 # 5단계
 if st.session_state.phase == 5 and st.session_state.case_options:
-    st.markdown("### 📋 5단계: 세부 위반 상황 선택 (엑셀/PDF 원문 확인)")
-    st.info("💡 타겟으로 지정하신 업종에 해당하는 처분기준표/문서 원문입니다.")
-    selected_case = st.radio("정확한 위반 상황:", st.session_state.case_options, key="case_radio")
+    st.markdown("### 📋 5단계: 세부 위반 조항 최종 확인 (DB 원문)")
+    st.info("💡 데이터베이스에서 검색된 실제 법령 및 처분 조항입니다. 해당하는 내역을 최종 선택해 주십시오.")
+    selected_case = st.radio("해당 위반 조항:", st.session_state.case_options, key="case_radio")
 
-    # [NEW] UI 깔끔 분리 로직 (스트리밍 대신 invoke 사용 + expander 적용)
-    if st.button("🚀 최종 리포트 생성", type="primary"):
-        with st.spinner("원본 교차 검증(PDF+엑셀) 및 3단계 자체 팩트 체크 중... (수 초 정도 소요됩니다)"):
+    # [UI 변경] 리포트 생성 버튼 및 검증 과정 문구를 공식적으로 변경
+    if st.button("📄 최종 법무 검토 및 행정처분 리포트 생성", type="primary"):
+        with st.spinner("법령(PDF) 및 처분기준(Excel) 교차 검증을 통한 최종 리포트를 산출하고 있습니다..."):
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
             rag_chain = PromptTemplate.from_template(TEMPLATE) | llm | StrOutputParser()
             
-            # 답변을 한 번에 받아옵니다.
             full_response = rag_chain.invoke({
                 "db_data": st.session_state.db_data,
                 "question": user_question, 
@@ -244,18 +245,15 @@ if st.session_state.phase == 5 and st.session_state.case_options:
                 "selected_case": selected_case
             })
             
-        st.markdown("### 📊 최종 분석 결과 리포트")
+        st.markdown("### 📊 최종 법무 검토 및 행정처분 리포트")
         
-        # ---FINAL_REPORT--- 구분선을 기준으로 답변을 두 동강 냅니다.
         if "---FINAL_REPORT---" in full_response:
             reasoning_part, report_part = full_response.split("---FINAL_REPORT---", 1)
             
-            # Pass 1, 1.5는 접어두기(expander) 상자 안에 넣습니다.
-            with st.expander("🕵️‍♂️ AI 자체 검증 과정 (Pass 1 & 1.5) - 클릭하여 펼쳐보기"):
+            # [UI 변경] Expander 제목을 전문가스럽게 변경
+            with st.expander("🔍 [참고] AI 교차 검색 로그 및 원문 팩트체크 내역 (클릭하여 펼치기)"):
                 st.markdown(reasoning_part.strip())
                 
-            # Pass 2 표는 바깥에 깔끔하게 출력합니다.
             st.markdown(report_part.strip())
         else:
-            # 혹시라도 AI가 구분선을 빼먹었을 경우를 대비한 안전 장치
             st.markdown(full_response)
