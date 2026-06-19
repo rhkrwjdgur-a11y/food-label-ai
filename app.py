@@ -45,16 +45,40 @@ if 'direction_options' not in st.session_state:
     st.session_state.direction_options = []
 if 'case_options' not in st.session_state:
     st.session_state.case_options = []
-if 'db_data' not in st.session_state:
-    st.session_state.db_data = ""
+if 'business_type' not in st.session_state:
+    st.session_state.business_type = "🌐 공통 적용 (업종 무관)"
 
-# --- 💡 엑셀(.xlsx) + PDF 통합 DB 로딩 ---
+# --- 💡 [NEW] 업종별 동적 DB 로딩 (네거티브 필터링 방식) ---
 @st.cache_data(show_spinner="사내 데이터베이스(관련 법령 및 행정처분 기준표)를 동기화 중입니다...")
-def load_all_documents():
+def load_filtered_documents(biz_type):
     combined_text = "==== [연세유업 마스터 통합 데이터베이스 (엑셀+PDF)] ====\n\n"
     
-    excel_files = glob.glob("*.xlsx")
-    for file in excel_files:
+    all_files = glob.glob("*.xlsx") + glob.glob("*.pdf")
+    filtered_files = []
+    
+    for f in all_files:
+        fname = f.lower()
+        
+        # [블랙리스트 방식 필터링]
+        if "식품제조" in biz_type:
+            # 일반 식품업종 선택 시 -> '축산물' 관련 법령만 철저히 배제, 나머지는 모두 포함(원산지, 유기농, 표시법 등)
+            if "축산물" not in fname:
+                filtered_files.append(f)
+                
+        elif "축산물" in biz_type:
+            # 축산물 업종 선택 시 -> '식품위생법'만 철저히 배제, 나머지는 모두 포함(원산지, 유기식품, 표시법 등)
+            if "식품위생법" not in fname:
+                filtered_files.append(f)
+                
+        else:
+            # 공통 또는 기타 업종 -> 모든 파일 포함
+            filtered_files.append(f)
+            
+    # 중복 파일 제거
+    filtered_files = list(set(filtered_files))
+
+    # 1. 엑셀 파일 로딩
+    for file in [f for f in filtered_files if f.endswith('.xlsx')]:
         try:
             df = pd.read_excel(file)
             combined_text += f"\n--- [엑셀 문서: {file}] ---\n"
@@ -62,8 +86,8 @@ def load_all_documents():
         except Exception as e:
             st.error(f"⚠️ {file} (엑셀) 읽기 실패: {e}")
             
-    pdf_files = glob.glob("*.pdf")
-    for file in pdf_files:
+    # 2. PDF 파일 로딩
+    for file in [f for f in filtered_files if f.endswith('.pdf')]:
         try:
             with open(file, 'rb') as f:
                 reader = PdfReader(f)
@@ -76,12 +100,10 @@ def load_all_documents():
         except Exception as e:
             st.error(f"⚠️ {file} (PDF) 읽기 실패: {e}")
             
-    if not excel_files and not pdf_files:
+    if not filtered_files:
         return "⚠️ 로딩된 데이터 파일이 없습니다. 시스템 폴더에 .xlsx 또는 .pdf 파일을 업로드해 주십시오."
         
     return combined_text
-
-st.session_state.db_data = load_all_documents()
 
 # --- 💡 프롬프트 정의 ---
 KEYWORD_TEMPLATE = """
@@ -96,32 +118,26 @@ DIRECTION_TEMPLATE = """
 당신은 연세유업의 수석 법무 검토관이자 현장 식약처 감사(Audit) 전문가입니다.
 사용자의 질문과 선택된 '법률 키워드'를 결합하여, 이를 처벌할 수 있는 '3가지 법률 적용 방향(관점)'을 제안하십시오.
 
-🚨 [절대 준수 규칙: 품목별 관할 법령 동적 매칭 및 연쇄 추론 알고리즘] 🚨
-1. 🥛 [품목 기반 법령 자동 분류]: 사용자의 질문에 등장하는 제품이 무엇인지 먼저 파악하십시오.
-   - 우유, 가공유, 발효유, 치즈 등 ➡️ 「축산물 위생관리법」 관점 우선 제안
-   - 두유, 과채음료, 일반 혼합음료 등 ➡️ 「식품위생법」 관점 우선 제안
-   - 품목이 불분명할 경우 두 법령의 관점을 모두 제안
-2. ✨[현장 감사 관점]: 사용자의 질문이 표면적인 절차 위반이라도, 실제 공장 감사 시 필연적으로 적발되는 파생 위반(예: 성분배합비율 불일치, 생산작업일지 및 원료출납 서류 허위 작성) 관점을 반드시 1개 이상 끌어내어 제안하십시오.
-3. [라벨/표시]: 무조건 「식품표시광고법」 관점을 제안하십시오.
-4. "제O조" 같은 구체적인 조항 번호는 절대로 지어내지 마십시오.
-5. 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
+🚨 [절대 준수 규칙] 🚨
+1. [품목 기반 법령 자동 분류]: 우유/치즈는 「축산물 위생관리법」, 두유/과채는 「식품위생법」 관점 우선 제안.
+2. [현장 감사 관점]: 표면적 위반 외에 파생 위반(성분배합비율, 서류 허위작성 등) 관점 반드시 포함.
+3. 부연 설명 없이 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
 
 사용자 질문: {question}
 선택된 키워드: {selected_keyword}
 """
 
-# [NEW] 물리적 키워드 차단(Hard Block) 및 일상어 통역 적용
 CASE_TEMPLATE = """
 당신은 엑셀 및 PDF 원문 추출 전담 AI입니다.
-사용자의 질문, [업종], [위반 구역]을 바탕으로 [마스터 통합 데이터베이스]에 '실제로 존재하는' 텍스트(행 또는 조항)만 3~5개 정확히 복사해서 객관식으로 만드십시오.
+사용자의 질문, [업종], [위반 구역]을 바탕으로 제공된 [마스터 통합 데이터베이스]에 '실제로 존재하는' 텍스트(행 또는 조항)만 3~5개 정확히 복사해서 객관식으로 만드십시오.
 
-🚨 [환각 원천 차단 및 감사 관점 매칭 규칙] 🚨
-1. 원문 100% 복사: DB에 없는 조항이나 문구를 단 한 글자라도 지어내면 안 됩니다.
+🚨 [환각 원천 차단 규칙] 🚨
+1. 원문 100% 복사: DB에 없는 조항을 지어내면 안 됩니다.
 2. 🏢 [업종(Business Type) 철벽 물리적 격리]: 실무자가 지정한 [{business_type}]을 철저히 확인하십시오.
    - 만약 '일반 식품'이 포함되어 있다면, 데이터베이스에서 '도축, 집유, 식육, 식용란' 단어가 들어간 조항은 무조건 제외하십시오.
    - 만약 '축산물'이 포함되어 있다면, 일반 식품위생법 조항을 무조건 제외하십시오.
-3. 🧠 [일상어 ↔ 법률어 자동 통역]: 실무자가 지정한 구역 [{selected_category}]나 질문에 "보건증", "지하수", "라벨 텍스트" 같은 현장 일상어가 입력되었더라도, 그 의미를 파악하여 DB 속 정확한 법률 용어(예: 건강진단, 수질검사, 표시사항)와 매칭하여 스캔하십시오.
-4. 억지 매칭 금지: 관련 항목이 도저히 없다면 반드시 "⚠️ DB에서 관련 항목을 찾을 수 없습니다"라고만 출력하십시오.
+3. ✨ [파생 위반 적극 추출]: 질문이 서류/보고와 관련된 편법이라면, 연관된 실제 처분 원문(장부 조작 등)도 객관식에 포함하십시오.
+4. 🧠 [일상어 ↔ 법률어 자동 통역]: 실무자가 입력한 "보건증", "지하수", "라벨" 등의 일상어를 법률 용어로 매칭하여 검색하십시오.
 5. 부연 설명 없이 숫자 1, 2, 3으로 시작하십시오.
 
 [마스터 통합 데이터베이스 (엑셀+PDF)]:
@@ -133,7 +149,6 @@ CASE_TEMPLATE = """
 강제 지정된 위반 구역: {selected_category}
 """
 
-# [NEW] 조항 번호 오류 및 처분 수위 믹스 방지
 TEMPLATE = """
 당신은 연세유업의 데이터베이스 통합 추출 전담 AI입니다.
 실무자가 최종 선택한 **[세부 위반 상황]**을 [마스터 통합 데이터베이스]에서 찾아내 리포트를 작성하십시오.
@@ -150,14 +165,14 @@ TEMPLATE = """
 ---FINAL_REPORT---
 
 ▶ **[Pass 2: 최종 리포트 도출 (출력)]**
-가독성을 위해 표와 텍스트를 명확히 분리하여 출력하십시오. <br> 태그는 절대로 사용하지 마십시오.
+가독성을 위해 표와 텍스트를 명확히 분리하여 출력하십시오. <br> 태그 금지.
 
 ### 📊 위반 사항 및 행정처분 요약
 
 | 구분 | 상세 검토 내용 |
 | :--- | :--- |
 | **1. 위반 의심 사항** | (질문 요약 및 위반 행위 팩트 기재) |
-| **2. 관련 법령 및 조항** | (반드시 '{selected_case}' 또는 DB 원문에 명시된 '법 제O조제O항' 형태의 공식 조항 번호만 기재. 업종명을 적지 마십시오.) |
+| **2. 관련 법령 및 조항** | (반드시 '{selected_case}' 또는 DB 원문에 명시된 공식 조항 번호만 기재. 업종명을 적지 마십시오.) |
 | **3. 위반사항 (원문)** | (반드시 '{selected_case}'의 텍스트와 100% 일치하는 DB 원문 전체 복사. 임의 요약 금지) |
 | **4. 행정처분 수위** | (반드시 '{selected_case}'에 해당하는 1차, 2차, 3차 처분 수위 팩트만 기재. 엉뚱한 조항의 처분을 섞지 마십시오.) |
 | **5. 과태료/과징금** | (DB에서 확인된 액수 팩트만 기재, 없으면 '해당 없음') |
@@ -181,7 +196,7 @@ TEMPLATE = """
 """
 
 # --- 💡 UI 구성 ---
-user_question = st.text_area("🔍 검토가 필요한 위반 의심 사례, 표시사항 누락 등 구체적인 상황을 입력해 주십시오:", height=100, placeholder="예시: 두유 배합비 동일 등록 건 / 우유 제품명 변경 건 등")
+user_question = st.text_area("🔍 검토가 필요한 위반 의심 사례, 표시사항 누락 등 구체적인 상황을 입력해 주십시오:", height=100)
 
 col1, col2 = st.columns([1, 5])
 with col1:
@@ -215,7 +230,6 @@ if st.session_state.phase >= 3 and st.session_state.direction_options:
 if st.session_state.phase >= 4:
     st.markdown("---")
     st.markdown("### 🗂️ 4단계: 검색 대상 업종 및 위반 유형 고정")
-    st.info("💡 빠르고 정확한 행정처분 기준 조회를 위해, 대상 업종 및 위반 카테고리를 특정해 주십시오.")
     
     st.markdown("#### ① 대상 업종 선택")
     biz_choices = [
@@ -224,7 +238,7 @@ if st.session_state.phase >= 4:
         "🏪 즉석판매제조·가공업 / 식품접객업",
         "🌐 공통 적용 (업종 무관)"
     ]
-    selected_biz = st.radio("처분 대상 업종:", biz_choices, key="biz_radio")
+    st.session_state.business_type = st.radio("처분 대상 업종:", biz_choices, key="biz_radio")
 
     st.markdown("#### ② 위반 쟁점 카테고리 선택")
     category_choices = [
@@ -239,18 +253,21 @@ if st.session_state.phase >= 4:
     selected_cat = st.radio("위반 카테고리:", category_choices, key="cat_radio")
 
     if selected_cat == "🔍 기타 위반 (직접 입력)":
-        custom_cat = st.text_input("💡 엑셀에서 집중적으로 검색할 키워드를 직접 입력해 주십시오 (예: 건강진단, 수질검사, 회수명령 등):")
+        custom_cat = st.text_input("💡 엑셀에서 집중적으로 검색할 키워드를 직접 입력해 주십시오 (예: 건강진단, 지하수 등):")
         if custom_cat:
             selected_cat = custom_cat
 
     if st.button("▶ 5단계: 조항 및 처분기준 조회", type="secondary"):
-        with st.spinner("선택된 업종 및 카테고리에 해당하는 사내 DB(법령/처분기준표)를 검색 중입니다..."):
+        with st.spinner("선택된 업종에 맞는 사내 DB만을 필터링하여 검색 중입니다..."):
+            # 4단계에서 선택한 업종에 맞춰 DB 동적 로드
+            current_db_data = load_filtered_documents(st.session_state.business_type)
+            
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
             st.session_state.case_options = [opt.strip() for opt in (PromptTemplate.from_template(CASE_TEMPLATE) | llm | StrOutputParser()).invoke({
-                "db_data": st.session_state.db_data,
+                "db_data": current_db_data,
                 "question": user_question,
                 "selected_direction": selected_dir,
-                "business_type": selected_biz,
+                "business_type": st.session_state.business_type,
                 "selected_category": selected_cat
             }).split('\n') if opt.strip() and opt[0].isdigit()]
             st.session_state.phase = 5
@@ -258,30 +275,27 @@ if st.session_state.phase >= 4:
 # 5단계
 if st.session_state.phase == 5 and st.session_state.case_options:
     st.markdown("### 📋 5단계: 세부 위반 조항 최종 확인 (DB 원문)")
-    st.info("💡 데이터베이스에서 검색된 실제 법령 및 처분 조항입니다. 해당하는 내역을 최종 선택해 주십시오.")
     selected_case = st.radio("해당 위반 조항:", st.session_state.case_options, key="case_radio")
 
     if st.button("📄 최종 법무 검토 및 행정처분 리포트 생성", type="primary"):
-        with st.spinner("법령(PDF) 및 처분기준(Excel) 교차 검증을 통한 최종 리포트를 산출하고 있습니다..."):
+        with st.spinner("최종 리포트를 산출하고 있습니다..."):
+            current_db_data = load_filtered_documents(st.session_state.business_type)
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
             rag_chain = PromptTemplate.from_template(TEMPLATE) | llm | StrOutputParser()
             
             full_response = rag_chain.invoke({
-                "db_data": st.session_state.db_data,
+                "db_data": current_db_data,
                 "question": user_question, 
-                "business_type": selected_biz,
+                "business_type": st.session_state.business_type,
                 "selected_category": selected_cat,
                 "selected_case": selected_case
             })
             
         st.markdown("### 📊 최종 법무 검토 및 행정처분 리포트")
-        
         if "---FINAL_REPORT---" in full_response:
             reasoning_part, report_part = full_response.split("---FINAL_REPORT---", 1)
-            
-            with st.expander("🔍 [참고] AI 교차 검색 로그 및 원문 팩트체크 내역 (클릭하여 펼치기)"):
+            with st.expander("🔍 [참고] AI 교차 검색 로그 및 원문 팩트체크 내역"):
                 st.markdown(reasoning_part.strip())
-                
             st.markdown(report_part.strip())
         else:
             st.markdown(full_response)
