@@ -4,3 +4,4 @@ gTTS
 Pillow
 moviepy==1.0.3
 python-pptx
+PyMuPDF
