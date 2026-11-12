@@ -1,5 +1,7 @@
 streamlit
 google-generativeai
+requests
+edge-tts
 gTTS
 Pillow
 moviepy==1.0.3
