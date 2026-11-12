@@ -283,31 +283,36 @@ def wrap_text_by_pixel(text, font, max_width, draw):
 # [6] 문서/이미지/리더 프로필 사진 추출 유틸리티
 # ==========================================
 def load_default_leader_photos_from_repo():
-    """깃허브 leaders/ 또는 font/ 폴더에 부문장님 사진이 저장되어 있으면 자동으로 불러옵니다."""
+    """
+    깃허브 저장소 내 모든 폴더(루트 및 하위 폴더 전체)를 스캔하여
+    4분 리더의 프로필 사진을 고정 로드합니다.
+    """
     photos = {}
     role_map = {
-        "생산본부": ["생산본부장", "생산본부", "공장장"],
-        "유제품생산부문": ["유제품생산부문장", "유제품부문장", "유제품"],
-        "상온제품생산부문": ["상온제품생산부문장", "상온부문장", "상온"],
-        "품질안전부문": ["품질안전부문장", "품질부문장", "품질안전"]
+        "생산본부": ["생산본부장", "생산본부", "본부장", "공장장", "leader1", "1_"],
+        "유제품생산부문": ["유제품생산부문장", "유제품부문장", "유제품", "leader2", "2_"],
+        "상온제품생산부문": ["상온제품생산부문장", "상온부문장", "상온", "leader3", "3_"],
+        "품질안전부문": ["품질안전부문장", "품질부문장", "품질안전", "품질", "오재필", "어성현", "leader4", "4_"]
     }
-    for search_dir in ["leaders", "font", "fonts", "."]:
-        if os.path.exists(search_dir) and os.path.isdir(search_dir):
-            for fname in os.listdir(search_dir):
-                lower_f = fname.lower()
-                if lower_f.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                    for dept_key, kw_list in role_map.items():
-                        if dept_key not in photos and any(kw in lower_f for kw in kw_list):
-                            full_p = os.path.join(search_dir, fname)
-                            try:
-                                with open(full_p, "rb") as rf:
-                                    photos[dept_key] = rf.read()
-                            except Exception:
-                                pass
+
+    # 깃허브 저장소 내 모든 폴더(.git 제외) 자동 탐색
+    for root_dir, dirs, files in os.walk("."):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for fname in sorted(files):
+            lower_f = fname.lower()
+            if lower_f.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                full_p = os.path.join(root_dir, fname)
+                for dept_key, kw_list in role_map.items():
+                    if dept_key not in photos and any(kw.lower() in lower_f for kw in kw_list):
+                        try:
+                            with open(full_p, "rb") as rf:
+                                photos[dept_key] = rf.read()
+                        except Exception:
+                            pass
     return photos
 
 def extract_text_and_Media_from_pptx(file_obj):
-    """PPTX에서 슬라이드 텍스트와 삽입된 이미지들을 함께 추출합니다."""
+    """참고용 본론 PPTX에서 슬라이드 텍스트와 삽입된 이미지들을 추출합니다."""
     file_bytes = file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read()
     prs = Presentation(io.BytesIO(file_bytes))
     full_text = []
@@ -325,7 +330,6 @@ def extract_text_and_Media_from_pptx(file_obj):
                 try:
                     blob = shape.image.blob
                     im = Image.open(io.BytesIO(blob))
-                    # 작은 따옴표 장식 아이콘(예: 66 아이콘) 제외하고 실제 사진/도면만 수집
                     if im.width >= 90 and im.height >= 90:
                         extracted_images.append({
                             "slide_idx": idx,
@@ -342,12 +346,12 @@ def extract_text_and_Media_from_pptx(file_obj):
 
     return "\n\n".join(full_text), extracted_images
 
-def parse_leader_pptx_with_photos(file_obj):
+def parse_leader_pptx_text_only(file_obj):
     """
-    '위생교육 전 말씀.pptx' 파일에서 4분 당부 말씀 텍스트와
-    슬라이드에 배치된 4분의 얼굴 사진(상단 1장 + 하단 좌/중/우 3장)을 동시에 추출합니다.
+    '위생교육 전 말씀.pptx' 파일에서 이미지는 절대 건드리지 않고,
+    오직 4분의 당부 말씀 텍스트만 추출합니다. (깃허브 고정 사진 보호)
     """
-    raw_text, pictures = extract_text_and_Media_from_pptx(file_obj)
+    raw_text, _ = extract_text_and_Media_from_pptx(file_obj)
     texts = {
         "생산본부": "",
         "유제품생산부문": "",
@@ -372,21 +376,7 @@ def parse_leader_pptx_with_photos(file_obj):
         if current_key:
             texts[current_key] = (texts[current_key] + " " + line).strip()
 
-    photos = {}
-    if len(pictures) >= 4:
-        # y좌표(top) 기준으로 가장 위쪽 사진 1장 = 생산본부장, 나머지 하단 3장을 x좌표(left) 순으로 정렬
-        sorted_by_top = sorted(pictures, key=lambda x: x["top"])
-        photos["생산본부"] = sorted_by_top[0]["bytes"]
-        bottom_three = sorted(sorted_by_top[1:4], key=lambda x: x["left"])
-        photos["유제품생산부문"] = bottom_three[0]["bytes"]
-        photos["상온제품생산부문"] = bottom_three[1]["bytes"]
-        photos["품질안전부문"] = bottom_three[2]["bytes"]
-    elif len(pictures) > 0:
-        keys_order = ["생산본부", "유제품생산부문", "상온제품생산부문", "품질안전부문"]
-        for i, pic in enumerate(pictures[:4]):
-            photos[keys_order[i]] = pic["bytes"]
-
-    return texts, photos
+    return texts
 
 def extract_pages_from_pdf(pdf_bytes):
     if not PYMUPDF_AVAILABLE:
@@ -1478,15 +1468,17 @@ def main():
         intro_custom_text = ""
         ldr_prod = ldr_dairy = ldr_ambient = ldr_qc = ""
 
-        if "PPTX 업로드" in intro_mode:
+       if "PPTX 업로드" in intro_mode:
             st.session_state["intro_full_slide_bytes"] = None
-            leader_pptx = st.file_uploader("📄 '위생교육 전 말씀.pptx' 업로드 (4분 말씀 텍스트 + 슬라이드 내 얼굴 사진 4장 자동 추출):", type=["pptx"], key="ldr_pptx")
+            # 깃허브 고정 사진이 비어있다면 다시 한 번 스캔하여 항상 고정 유지
+            if not st.session_state.get("leader_photos"):
+                st.session_state["leader_photos"] = load_default_leader_photos_from_repo()
+
+            leader_pptx = st.file_uploader("📄 '위생교육 전 말씀.pptx' 업로드 (4분 말씀 텍스트만 자동 추출 / 사진은 깃허브 고정 사진 유지):", type=["pptx"], key="ldr_pptx")
             parsed_leaders = {}
             if leader_pptx:
-                parsed_leaders, extracted_photos = parse_leader_pptx_with_photos(leader_pptx)
-                if extracted_photos:
-                    st.session_state["leader_photos"].update(extracted_photos)
-                    st.success(f"PPTX에서 텍스트 및 부문장님 사진 {len(extracted_photos)}장을 성공적으로 추출했습니다!")
+                parsed_leaders = parse_leader_pptx_text_only(leader_pptx)
+                st.success("PPTX에서 4분의 당부 말씀 텍스트만 깔끔하게 추출했습니다! (프로필 사진은 깃허브 원본 고정)")
 
             default_prod = parsed_leaders.get("생산본부") or "일교차가 커지면서 외부 해충이나 이물질이 따뜻한 실내 작업장으로 유입되기 쉬워 각별한 주의가 필요한 시기입니다. 우리 연세유업 아산공장의 흔들림 없는 식품 안전은 결국 현장에 계신 여러분의 빈틈없는 이물 관리와 밀폐 수칙 준수에서 시작됩니다. 현장에 정착된 철저한 HACCP 실행력을 바탕으로 위해요소를 사전에 100% 차단하는 든든한 방어선 역할을 해 주시길 당부 드립니다."
             default_dairy = parsed_leaders.get("유제품생산부문") or "유제품은 미생물과 주변 환경변화에 매우 민감한 특성을 가지고 있습니다. 공장 천정, 덕트, 배관 표면 등에 결로가 발생하면 곰팡이 증식 조건이 되므로 작업장 환경 청소와 철저한 건조 관리에 많은 관심이 필요합니다. 일일 건강 모니터링도 철저히 실천해 주시기 바랍니다."
