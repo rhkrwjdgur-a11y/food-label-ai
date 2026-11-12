@@ -1468,7 +1468,7 @@ def main():
         intro_custom_text = ""
         ldr_prod = ldr_dairy = ldr_ambient = ldr_qc = ""
 
-       if "PPTX 업로드" in intro_mode:
+if "PPTX 업로드" in intro_mode:
             st.session_state["intro_full_slide_bytes"] = None
             # 깃허브 고정 사진이 비어있다면 다시 한 번 스캔하여 항상 고정 유지
             if not st.session_state.get("leader_photos"):
@@ -1479,7 +1479,6 @@ def main():
             if leader_pptx:
                 parsed_leaders = parse_leader_pptx_text_only(leader_pptx)
                 st.success("PPTX에서 4분의 당부 말씀 텍스트만 깔끔하게 추출했습니다! (프로필 사진은 깃허브 원본 고정)")
-
             default_prod = parsed_leaders.get("생산본부") or "일교차가 커지면서 외부 해충이나 이물질이 따뜻한 실내 작업장으로 유입되기 쉬워 각별한 주의가 필요한 시기입니다. 우리 연세유업 아산공장의 흔들림 없는 식품 안전은 결국 현장에 계신 여러분의 빈틈없는 이물 관리와 밀폐 수칙 준수에서 시작됩니다. 현장에 정착된 철저한 HACCP 실행력을 바탕으로 위해요소를 사전에 100% 차단하는 든든한 방어선 역할을 해 주시길 당부 드립니다."
             default_dairy = parsed_leaders.get("유제품생산부문") or "유제품은 미생물과 주변 환경변화에 매우 민감한 특성을 가지고 있습니다. 공장 천정, 덕트, 배관 표면 등에 결로가 발생하면 곰팡이 증식 조건이 되므로 작업장 환경 청소와 철저한 건조 관리에 많은 관심이 필요합니다. 일일 건강 모니터링도 철저히 실천해 주시기 바랍니다."
             default_ambient = parsed_leaders.get("상온제품생산부문") or "상온제품의 안전성을 책임지는 핵심은 멸균 온도 관리와 여과망 점검 등 철저한 CCP 모니터링에 있습니다. 각 공정의 한계기준을 명확히 숙지하고 이탈 시 즉각적인 조치가 이루어질 수 있도록 만전을 기해 주십시오. 완벽한 CCP 점검과 작업장 밀폐를 당부드립니다."
