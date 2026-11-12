@@ -1,291 +1,740 @@
 import streamlit as st
+import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import socket
+import time
+import json
 import os
-import glob
-import pandas as pd
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+import io
+import re
+import datetime
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
 
-# PyPDF2 대신 환경에 맞춘 최신 pypdf 사용
-try:
-    from pypdf import PdfReader
-except ImportError:
-    st.error("⚠️ pypdf 라이브러리가 설치되지 않았습니다. requirements.txt를 확인해주세요.")
+# ==========================================
+# [1] UI 레이아웃 및 네트워크 방어 설정 (최상단 필수)
+# ==========================================
+st.set_page_config(page_title="연세유업 AI 교육 영상 스튜디오", layout="wide")
+socket.setdefaulttimeout(600)
 
-# [로고 적용] 탭 아이콘 변경
-st.set_page_config(page_title="AI 식품/축산물 규제 검토 시스템", page_icon="yonsei_logo.png", layout="wide")
+# ==========================================
+# [2] 보안 접속 설정 (기존 시스템 동일 비밀번호 적용)
+# ==========================================
+def check_password():
+    def password_entered():
+        if st.session_state["password"] == "2082":
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+    if "password_correct" not in st.session_state:
+        st.text_input("시스템 접속 비밀번호 입력", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.text_input("비밀번호 오류. 다시 입력하세요.", type="password", on_change=password_entered, key="password")
+        return False
+    else:
+        return True
 
-# --- 💡 헤더 및 로고 배치 ---
-title_col1, title_col2 = st.columns([0.7, 9.3])
-with title_col1:
+# ==========================================
+# [3] API 키 로드 및 모델 설정
+# ==========================================
+API_KEY = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+
+DEFAULT_MODEL = "gemini-3.8-flash"
+
+# ==========================================
+# [4] 커스텀 CSS (모던 다크 슬레이트 테마)
+# ==========================================
+custom_theme_css = """
+<style>
+@media screen {
+    html, body, [class*="css"] {
+        color: #1e293b !important;
+        font-family: 'Pretendard', -apple-system, sans-serif !important;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #f8fafc !important;
+        border-right: 1px solid #e2e8f0 !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        border-bottom: 2px solid #e2e8f0 !important;
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: transparent !important;
+        border: none !important;
+        border-bottom: 3px solid transparent !important;
+        border-radius: 0 !important;
+        padding: 12px 16px !important;
+        color: #64748b !important;
+        font-weight: 600 !important;
+    }
+    .stTabs [aria-selected="true"] {
+        border-bottom: 3px solid #0f172a !important;
+        color: #0f172a !important;
+        background-color: transparent !important;
+    }
+    .stButton>button {
+        background-color: #0f172a !important;
+        color: white !important;
+        font-size: 15px !important;
+        font-weight: bold !important;
+        border-radius: 8px !important;
+        border: none !important;
+        padding: 12px 24px !important;
+        transition: all 0.2s ease-in-out;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+    }
+    .stButton>button:hover {
+        background-color: #334155 !important;
+        transform: translateY(-1px);
+    }
+    .stTextInput>div>div>input, .stTextArea>div>div>textarea, .stFileUploader {
+        border: 2px solid #cbd5e1 !important;
+        border-radius: 6px !important;
+        background-color: #ffffff !important;
+    }
+    hr {
+        border-top: 2px solid #cbd5e1 !important;
+        margin: 1.5em 0 !important;
+    }
+}
+</style>
+"""
+
+# ==========================================
+# [5] 유틸리티 및 파일 파싱 함수
+# ==========================================
+def get_korean_font(size, is_bold=False):
+    """
+    로컬 폴더, 리눅스 서버(fonts-nanum), 윈도우 환경을 모두 탐색하여
+    한글이 절대 깨지지 않도록 폰트를 로드하는 방어 함수입니다.
+    """
+    font_candidates = [
+        "NanumGothicBold.ttf" if is_bold else "NanumGothic.ttf",
+        "malgunbd.ttf" if is_bold else "malgun.ttf",
+        "Pretendard-Bold.ttf" if is_bold else "Pretendard-Regular.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf" if is_bold else "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf" if is_bold else "C:/Windows/Fonts/malgun.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc"
+    ]
+    for path in font_candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+def extract_text_from_pptx(file_obj):
+    """업로드된 PPTX 파일에서 슬라이드별 텍스트를 100% 추출합니다."""
     try:
-        st.image("yonsei_logo.png", width=70) 
-    except:
-        st.title("🏢") 
+        prs = Presentation(file_obj)
+        full_text = []
+        for idx, slide in enumerate(prs.slides):
+            slide_texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for paragraph in shape.text_frame.paragraphs:
+                        txt = paragraph.text.strip()
+                        if txt:
+                            slide_texts.append(txt)
+            if slide_texts:
+                full_text.append(f"[슬라이드 {idx+1}]\n" + "\n".join(slide_texts))
+        return "\n\n".join(full_text)
+    except Exception as e:
+        return f"[PPTX 추출 오류]: {e}"
 
-with title_col2:
-    st.title("연세유업 규제 및 행정처분 AI 검색 시스템")
+def wrap_text_by_pixel(text, font, max_width, draw):
+    """긴 문장이 슬라이드 화면 밖으로 나가지 않도록 픽셀 단위로 계산해 자동 줄바꿈합니다."""
+    lines = []
+    for paragraph in text.split('\n'):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            lines.append("")
+            continue
+        words = paragraph.split(' ')
+        current_line = ""
+        for word in words:
+            test_line = f"{current_line} {word}".strip() if current_line else word
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            line_width = bbox[2] - bbox[0]
+            if line_width <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+    return lines
 
-st.markdown("""
-**식품·축산물 관련 법령 및 행정처분 기준을 신속하고 정확하게 조회하기 위한 사내 AI 법무 검토 솔루션입니다.** *(※ 식약처 고시, 법령 원문(PDF) 및 사내 처분기준표(Excel)를 교차 검증하여 환각(오류) 없는 신뢰도 높은 리포트를 도출합니다.)*
-""")
+# ==========================================
+# [6] 미디어 생성 코어 함수 (Slide Image, PPTX, TTS, Video)
+# ==========================================
+def create_slide_image(slide_data, slide_idx, total_slides, output_path):
+    """
+    만약 사용자가 직접 업로드한 슬라이드 원본 이미지가 있으면 그것을 그대로 사용하고,
+    없으면 연세유업 표준 와이드(16:9) 디자인으로 고해상도 슬라이드 이미지를 렌더링합니다.
+    """
+    if slide_data.get("custom_image_bytes"):
+        img = Image.open(io.BytesIO(slide_data["custom_image_bytes"])).convert("RGB")
+        img = img.resize((1280, 720), Image.Resampling.LANCZOS)
+        img.save(output_path)
+        return output_path
 
-try:
-    google_api_key = st.secrets["GOOGLE_API_KEY"]
-except KeyError:
-    st.error("⚠️ 시스템 설정(Secrets)에 GOOGLE_API_KEY가 등록되지 않았습니다.")
-    st.stop()
+    width, height = 1280, 720
+    img = Image.new('RGB', (width, height), color=(15, 23, 42)) # 다크 네이비 배경
+    draw = ImageDraw.Draw(img)
 
-# --- 💡 세션 상태 초기화 ---
-if 'phase' not in st.session_state:
-    st.session_state.phase = 1
-if 'keyword_options' not in st.session_state:
-    st.session_state.keyword_options = []
-if 'direction_options' not in st.session_state:
-    st.session_state.direction_options = []
-if 'case_options' not in st.session_state:
-    st.session_state.case_options = []
-if 'business_type' not in st.session_state:
-    st.session_state.business_type = "🌐 공통 적용 (업종 무관)"
+    # 상단 헤더 바 및 하단 푸터 바 디자인
+    draw.rectangle([(0, 0), (width, 95)], fill=(30, 41, 59))
+    draw.rectangle([(0, 95), (width, 100)], fill=(56, 189, 248)) # 스카이 블루 포인트 라인
+    draw.rectangle([(0, height - 50), (width, height)], fill=(15, 23, 42))
 
-# --- 💡 업종별 동적 DB 로딩 (네거티브 필터링 방식) ---
-@st.cache_data(show_spinner="사내 데이터베이스(관련 법령 및 행정처분 기준표)를 동기화 중입니다...")
-def load_filtered_documents(biz_type):
-    combined_text = "==== [연세유업 마스터 통합 데이터베이스 (엑셀+PDF)] ====\n\n"
-    
-    all_files = glob.glob("*.xlsx") + glob.glob("*.pdf")
-    filtered_files = []
-    
-    for f in all_files:
-        fname = f.lower()
-        
-        # [블랙리스트 방식 필터링]
-        if "식품제조" in biz_type:
-            if "축산물" not in fname:
-                filtered_files.append(f)
-        elif "축산물" in biz_type:
-            if "식품위생법" not in fname:
-                filtered_files.append(f)
-        else:
-            filtered_files.append(f)
-            
-    filtered_files = list(set(filtered_files))
+    font_badge = get_korean_font(20, is_bold=True)
+    font_title = get_korean_font(42, is_bold=True)
+    font_content = get_korean_font(30, is_bold=False)
+    font_footer = get_korean_font(18, is_bold=False)
 
-    for file in [f for f in filtered_files if f.endswith('.xlsx')]:
-        try:
-            df = pd.read_excel(file)
-            combined_text += f"\n--- [엑셀 문서: {file}] ---\n"
-            combined_text += df.to_markdown(index=False) + "\n\n"
-        except Exception as e:
-            st.error(f"⚠️ {file} (엑셀) 읽기 실패: {e}")
-            
-    for file in [f for f in filtered_files if f.endswith('.pdf')]:
-        try:
-            with open(file, 'rb') as f:
-                reader = PdfReader(f)
-                combined_text += f"\n--- [PDF 문서: {file}] ---\n"
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        combined_text += text + "\n"
-                combined_text += "\n\n"
-        except Exception as e:
-            st.error(f"⚠️ {file} (PDF) 읽기 실패: {e}")
-            
-    if not filtered_files:
-        return "⚠️ 로딩된 데이터 파일이 없습니다. 시스템 폴더에 .xlsx 또는 .pdf 파일을 업로드해 주십시오."
-        
-    return combined_text
+    # 슬라이드 타입 뱃지 표시
+    slide_type = slide_data.get("type", "BODY")
+    badge_map = {
+        "INTRO": ("LEADER MESSAGE | 부문장 당부 말씀", (2, 132, 199)),
+        "BODY": ("SAFETY & QUALITY | 본 교육 과정", (15, 118, 110)),
+        "OUTRO": ("EVENT & NOTICE | 교육 이벤트 및 공지", (109, 40, 217))
+    }
+    badge_text, badge_color = badge_map.get(slide_type, ("EDUCATION", (71, 85, 105)))
 
-# --- 💡 프롬프트 정의 ---
-KEYWORD_TEMPLATE = """
-당신은 현장 용어를 법률 용어로 번역하는 AI입니다.
-사용자의 질문에서 고유명사를 제거하고, 법전에서 검색될 만한 '3가지 다른 뉘앙스의 법률 키워드(행위 본질)' 옵션을 제안하십시오.
-절대 부연 설명 없이, 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
+    draw.rounded_rectangle([(60, 25), (460, 70)], radius=8, fill=badge_color)
+    draw.text((80, 34), badge_text, font=font_badge, fill=(255, 255, 255))
 
-사용자 질문: {question}
-"""
+    # 우측 상단 기관 로고 텍스트
+    draw.text((width - 360, 36), "연세유업 아산공장 식품안전팀", font=font_badge, fill=(148, 163, 184))
 
-DIRECTION_TEMPLATE = """
-당신은 연세유업의 수석 법무 검토관이자 현장 식약처 감사(Audit) 전문가입니다.
-사용자의 질문과 선택된 '법률 키워드'를 결합하여, 이를 처벌할 수 있는 '3가지 법률 적용 방향(관점)'을 제안하십시오.
+    # 메인 제목 렌더링
+    title_text = slide_data.get("title", f"슬라이드 {slide_idx + 1}")
+    draw.text((70, 130), title_text, font=font_title, fill=(255, 255, 255))
 
-🚨 [절대 준수 규칙] 🚨
-1. [품목 기반 법령 자동 분류]: 우유/치즈는 「축산물 위생관리법」, 두유/과채는 「식품위생법」 관점 우선 제안.
-2. [현장 감사 관점]: 표면적 위반 외에 파생 위반(성분배합비율, 서류 허위작성 등) 관점 반드시 포함.
-3. 부연 설명 없이 숫자 1, 2, 3으로 시작하는 3줄의 텍스트만 출력하십시오.
+    # 본문 컨텐츠 박스 배경
+    draw.rounded_rectangle([(60, 210), (width - 60, height - 70)], radius=12, fill=(30, 41, 59), outline=(51, 65, 85), width=2)
 
-사용자 질문: {question}
-선택된 키워드: {selected_keyword}
-"""
+    # 본문 텍스트 자동 줄바꿈 및 렌더링
+    content_text = slide_data.get("content", "")
+    wrapped_lines = wrap_text_by_pixel(content_text, font_content, width - 180, draw)
 
-CASE_TEMPLATE = """
-당신은 데이터베이스 원문 분석 및 요약 전담 AI입니다.
-사용자의 질문, [업종], [위반 구역]을 바탕으로 제공된 [마스터 통합 데이터베이스]에서 관련 조항을 찾으십시오.
+    y_text = 240
+    for line in wrapped_lines:
+        if y_text > height - 110:
+            break
+        draw.text((90, y_text), line, font=font_content, fill=(226, 232, 240))
+        y_text += 48
 
-🚨 [가독성, 스포일러 방지 및 🔀 조건 분기 상세 작성 규칙] 🚨
-1. 실무자가 한눈에 읽을 수 있도록 요약된 형태로 3~5개 제안하십시오.
-2. ⚠️ [처분 수위 노출 금지]: 5단계에서는 "영업정지 1개월" 같은 처분 결과를 절대 텍스트에 노출하지 마십시오.
-3. 🔀 [상황 분기 및 구체적 요약 강제]: 사용자의 상황이 '내부 공정용'인지 '외부 판매용'인지 등에 따라 적용 법조항이 극명하게 갈리는 경우, 단순히 태그만 출력하지 말고 반드시 **[조건 태그] + [관련 법령 번호] + 구체적인 위반 행위 요약** 형태로 완성된 문장을 출력하십시오. 실무자가 구체적인 내용을 보고 팩트에 맞는 것을 직접 선택할 수 있어야 합니다.
-   - 🟢 올바른 예시: [⭐ AI 강력 추천] [내부 공정 사용 시] [법 제O조] 냉동 원재료 해동 과정에서 해동 시간 및 작업자 미표시
-   - ❌ 잘못된 예시: [내부 사용 목적] (위반 내용이 누락됨 - 절대 금지)
-4. 🎯 [AI 추천 마크]: 가장 리스크가 크고 정황에 부합하는 조항 하나에 `[⭐ AI 강력 추천]` 마크를 달아주십시오.
-5. 부연 설명 없이 숫자 1, 2, 3으로 시작하십시오.
+    # 하단 페이지 번호
+    draw.text((width - 150, height - 38), f"Page {slide_idx + 1} / {total_slides}", font=font_footer, fill=(100, 116, 139))
 
-[마스터 통합 데이터베이스 (엑셀+PDF)]:
-{db_data}
+    img.save(output_path)
+    return output_path
 
-사용자 질문: {question}
-선택된 법률 방향: {selected_direction}
-강제 지정된 업종: {business_type}
-강제 지정된 위반 구역: {selected_category}
-"""
+def generate_editable_pptx(slides_data):
+    """
+    생성된 슬라이드 기획안을 바탕으로 공장장님 보고 및 실무 수정이 가능한
+    실제 파워포인트(.pptx) 파일을 생성하여 메모리 버퍼로 반환합니다.
+    """
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank_layout = prs.slide_layouts[6]
 
-TEMPLATE = """
-당신은 연세유업의 데이터베이스 통합 추출 전담 AI입니다.
-실무자가 선택한 요약된 위반 상황('{selected_case}')을 바탕으로, [마스터 통합 데이터베이스]로 다시 돌아가 정확한 팩트를 찾아 리포트를 작성하십시오. (선택지 앞의 [⭐ AI 강력 추천] 텍스트나 [조건] 태그는 검색 시 무시하고 핵심 위반 내용만으로 원문을 찾으십시오.)
+    for idx, slide_data in enumerate(slides_data):
+        slide = prs.slides.add_slide(blank_layout)
 
-🚨 [최종 리포트 도출 3단계 검증 프로세스] 🚨
+        # 배경색 설정
+        background = slide.background
+        fill = background.fill
+        fill.solid()
+        fill.fore_color.rgb = RGBColor(15, 23, 42)
 
-▶ **[Pass 1: DB 원문 역추적 및 팩트 추출]**
-1. 선택된 요약본('{selected_case}')과 의미가 100% 일치하는 실제 엑셀/PDF 원문 데이터를 찾으십시오.
-2. ⚠️ [법령 물리적 격리]: [{business_type}]이 '일반 식품'을 포함하면 「축산물 위생관리법」 관련 조항을 절대 출력하지 마십시오.
+        # 제목 텍스트 상자
+        tx_title = slide.shapes.add_textbox(Inches(0.8), Inches(0.6), Inches(11.7), Inches(1.2))
+        tf_title = tx_title.text_frame
+        tf_title.word_wrap = True
+        p_title = tf_title.paragraphs[0]
+        p_title.text = f"[{slide_data.get('type', 'SLIDE')}] {slide_data.get('title', '')}"
+        p_title.font.size = Pt(32)
+        p_title.font.bold = True
+        p_title.font.color.rgb = RGBColor(56, 189, 248)
 
-▶ **[Pass 1.5: 파생 위반 리스크 팩트체크]**
-장부 조작 등 연쇄 적발될 수 있는 조항을 찾되, [법령 물리적 격리]를 준수하십시오.
+        # 본문 텍스트 상자
+        tx_body = slide.shapes.add_textbox(Inches(0.8), Inches(2.0), Inches(11.7), Inches(4.8))
+        tf_body = tx_body.text_frame
+        tf_body.word_wrap = True
 
----FINAL_REPORT---
+        lines = slide_data.get("content", "").split('\n')
+        for i, line in enumerate(lines):
+            p = tf_body.paragraphs[0] if i == 0 else tf_body.add_paragraph()
+            p.text = line.strip()
+            p.font.size = Pt(20)
+            p.font.color.rgb = RGBColor(241, 245, 249)
+            p.space_after = Pt(14)
 
-▶ **[Pass 2: 최종 리포트 도출 (출력)]**
-가독성을 위해 표를 사용하지 말고, 아래 제시된 강조형 리스트 포맷을 정확히 지켜서 출력하십시오. HTML 태그(br 등) 절대 사용 금지.
+        # 슬라이드 노트(발표자 노트)에 음성 더빙 대본 자동 삽입
+        notes_slide = slide.notes_slide
+        text_frame = notes_slide.notes_text_frame
+        text_frame.text = f"[AI 성우 내레이션 대본]\n{slide_data.get('script', '')}"
 
-### 📊 위반 사항 및 행정처분 요약
+    pptx_io = io.BytesIO()
+    prs.save(pptx_io)
+    pptx_io.seek(0)
+    return pptx_io.getvalue()
 
-* **1. 위반 의심 사항:** (질문 요약 및 위반 행위 팩트 기재)
-* **2. 관련 법령 및 조항:** (DB 원문에 명시된 공식 조항 번호 기재)
-* **3. 위반사항 (원문):** > (역추적하여 찾아낸 DB 내 실제 텍스트 원문 전체 복사. 요약 금지)
-* **4. 행정처분 수위 및 정확한 출처:** [1차] 내용 / [2차] 내용 / [3차] 내용 (※ 처분 근거: OOO법 시행규칙 [별표 OO] 제O호 등 DB에서 찾은 가장 정확한 출처를 반드시 명시하여 실무자가 직접 법전을 찾아볼 수 있게 할 것)
-* **5. 과태료/과징금:** (DB에서 확인된 액수 팩트만 기재, 없으면 '해당 없음')
+def create_tts_audio(script_text, output_path):
+    """대본 텍스트를 읽어 MP3 오디오 파일로 변환합니다."""
+    clean_script = re.sub(r'[\*\#\[\]\(\)]', ' ', script_text).strip()
+    if not clean_script:
+        clean_script = "다음 화면을 확인해 주시기 바랍니다."
+    tts = gTTS(text=clean_script, lang='ko', slow=False)
+    tts.save(output_path)
+    return output_path
 
----
-### 🚨 [중요] 연쇄 파생 위반 리스크
-(표면적 위반 외에 연쇄 적발될 수 있는 조항 및 처분 수위를 글머리기호(-)로 나열. 여기에도 괄호 열고 시행규칙 [별표 OO] 등 근거를 짧게 명시할 것)
+def media_worker(idx, slide_data, total_slides, temp_dir):
+    """ThreadPoolExecutor에서 병렬로 이미지와 오디오를 동시에 찍어내는 워커 함수입니다."""
+    img_path = os.path.join(temp_dir, f"slide_{idx:03d}.png")
+    audio_path = os.path.join(temp_dir, f"audio_{idx:03d}.mp3")
+    create_slide_image(slide_data, idx, total_slides, img_path)
+    create_tts_audio(slide_data.get("script", ""), audio_path)
+    return idx, img_path, audio_path
 
----
-### 💡 품질관리 및 대응 가이드
-(글머리기호(1. 2. 3.)를 사용하여 구체적 대처 방안 나열)
+# ==========================================
+# [7] Gemini AI 기획 엔진 (CoT + JSON 추출)
+# ==========================================
+def generate_ai_storyboard(model_name, topic, body_slide_count, intro_config, outro_config, uploaded_gemini_files, extra_source_text):
+    model = genai.GenerativeModel(model_name)
+    generation_config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=65536)
 
-[마스터 통합 데이터베이스]:
-{db_data}
+    # 1. 인트로(4대 부문장 당부 말씀) 지시문 조립
+    if intro_config["mode"] == "AI 자동 생성 (4대 부문장 맞춤형)":
+        intro_instruction = f"""
+        [슬라이드 1 (고정 인트로 - 4대 부문장 당부 말씀)]:
+        - 반드시 첫 번째 슬라이드("type": "INTRO")는 교육 시작에 앞서 당사 4명의 리더(공장장, 상온부문장, 유제품부문장, 품질안전부문장)가 '{topic}' 주제와 관련하여 현장 작업자들에게 전하는 핵심 당부 말씀으로 구성하십시오.
+        - 화면 텍스트(content)에는 아래 4줄 포맷을 그대로 유지하여 핵심 요약을 적으십시오:
+          • 공장장: (주제 관련 당부 1줄)
+          • 상온부문장: (상온/멸균 제품 라인 특성에 맞춘 당부 1줄)
+          • 유제품부문장: (우유/발효유 등 유가공 라인 특성에 맞춘 당부 1줄)
+          • 품질안전부문장: (HACCP 및 식품안전 규격 준수 당부 1줄)
+        - 내레이션 대본(script)은 이 4명의 리더 말씀을 자연스럽게 브리핑하며 교육의 중요성을 일깨우는 아나운서 톤으로 작성하십시오.
+        """
+    elif intro_config["mode"] == "확정된 PPT/텍스트 직접 반영 (공장장님 컨펌본)":
+        intro_instruction = f"""
+        [슬라이드 1 (고정 인트로 - 컨펌 완료본 반영)]:
+        - 첫 번째 슬라이드("type": "INTRO")는 사용자가 입력한 아래의 [확정된 당부 말씀 원문]을 훼손하지 말고 화면 텍스트(content)에 깔끔하게 정리하여 배치하십시오.
+        - 내레이션 대본(script)은 해당 원문을 바탕으로 각 부문장님의 말씀 요약을 정중하고 명확하게 전달하는 대본으로 작성하십시오.
+        - [확정된 당부 말씀 원문]:\n{intro_config["custom_text"]}
+        """
+    else:
+        intro_instruction = "[인트로 생략]: 별도의 부문장 당부 말씀 인트로 없이 곧바로 본론 교육 슬라이드(\"type\": \"BODY\")부터 시작하십시오."
 
----
-사용자 질문: {question}
-강제 지정된 업종: {business_type}
-선택된 위반 구역: {selected_category}
-실무자가 선택한 요약 상황: {selected_case}
-"""
+    # 2. 아웃트로(이벤트 안내) 지시문 조립
+    if outro_config["include"]:
+        outro_instruction = f"""
+        [마지막 슬라이드 (고정 아웃트로 - 이벤트 및 공지 안내)]:
+        - 반드시 배열의 가장 마지막 슬라이드("type": "OUTRO")는 교육 종료 후 참여 이벤트/퀴즈 안내 화면으로 구성하십시오.
+        - 아래 제공된 [이벤트 안내 내용]을 바탕으로 화면 텍스트(content)와 독려 내레이션 대본(script)을 작성하십시오.
+        - [이벤트 안내 내용]:\n{outro_config["text"]}
+        """
+    else:
+        outro_instruction = "[아웃트로 생략]: 별도의 이벤트 안내 슬라이드를 추가하지 마십시오."
 
-# --- 💡 UI 구성 ---
-user_question = st.text_area("🔍 검토가 필요한 위반 의심 사례, 표시사항 누락 등 구체적인 상황을 입력해 주십시오:", height=100)
+    system_prompt = f"""
+    당신은 대한민국 최고의 식품안전(HACCP) 및 품질관리(QC) 사내 교육 기획 전문가입니다.
+    연세유업 아산공장 임직원을 대상으로 한 교육 영상 슬라이드(PPT 화면 텍스트)와 성우 더빙용 내레이션 대본을 설계해야 합니다.
+    추측이나 거짓 정보를 배제하고 오직 명확한 법적/과학적 팩트와 제공된 원본 자료만을 기반으로 작성하십시오.
 
-col1, col2 = st.columns([1, 5])
-with col1:
-    if st.button("▶ 1단계: 법률 키워드 추출", type="primary"):
-        if user_question.strip():
-            with st.spinner("AI가 상황을 분석하여 법률 키워드를 추출하고 있습니다..."):
-                llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.2)
-                st.session_state.keyword_options = [opt.strip() for opt in (PromptTemplate.from_template(KEYWORD_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question}).split('\n') if opt.strip() and opt[0].isdigit()]
-                st.session_state.phase = 2
+    [교육 주제]: {topic}
+    [본론(BODY) 슬라이드 생성 장수]: 정확히 {body_slide_count}장 (인트로/아웃트로 제외)
 
-# 2단계
-if st.session_state.phase >= 2 and st.session_state.keyword_options:
-    st.markdown("### 🎯 2단계: 분석 대상 법률 키워드 선택")
-    selected_kw = st.radio("적용할 핵심 키워드 지정:", st.session_state.keyword_options, key="kw_radio")
-    
-    if st.button("▶ 3단계: 법률 적용 관점 분석", type="secondary"):
-        with st.spinner("해당 키워드를 바탕으로 법률 쟁점을 분석 중입니다..."):
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.2)
-            st.session_state.direction_options = [opt.strip() for opt in (PromptTemplate.from_template(DIRECTION_TEMPLATE) | llm | StrOutputParser()).invoke({"question": user_question, "selected_keyword": selected_kw}).split('\n') if opt.strip() and opt[0].isdigit()]
-            st.session_state.phase = 3
+    {intro_instruction}
 
-# 3단계
-if st.session_state.phase >= 3 and st.session_state.direction_options:
-    st.markdown("### 🏛️ 3단계: 검토 대상 법률 확정")
-    selected_dir = st.radio("검토를 진행할 법률 관점 지정:", st.session_state.direction_options, key="dir_radio")
-    
-    if st.button("▶ 4단계: 업종 및 위반 유형 지정", type="secondary"):
-        st.session_state.phase = 4
+    [본론 슬라이드 ("type": "BODY") 작성 원칙]:
+    - 업로드된 영상/문서 자료가 있다면 화면 속의 표, 한계기준 수치(온도/시간/농도 등), 핵심 수칙을 100% 반영하여 {body_slide_count}장의 슬라이드로 논리적으로 분할하십시오.
+    - 각 슬라이드의 화면 텍스트(content)는 작업자가 한눈에 보기 쉽게 개조식(• 기호 활용)으로 3~5줄 이내로 명확히 요약하십시오.
+    - 각 슬라이드의 내레이션 대본(script)은 화면 텍스트를 그대로 기계적으로 읽지 말고, 실제 강사가 설명하듯 자연스러운 구어체 존댓말("~입니다", "~해주시기 바랍니다")로 상세히 풀어서 작성하십시오.
 
-# 4단계
-if st.session_state.phase >= 4:
-    st.markdown("---")
-    st.markdown("### 🗂️ 4단계: 검색 대상 업종 및 위반 유형 고정")
-    
-    st.markdown("#### ① 대상 업종 선택")
-    biz_choices = [
-        "🏢 식품제조·가공업 (일반 식품, 두유, 과채음료 등)",
-        "🥩 축산물가공업 / 식육포장처리업 (유가공품, 우유, 치즈 등)",
-        "🏪 즉석판매제조·가공업 / 식품접객업",
-        "🌐 공통 적용 (업종 무관)"
+    {outro_instruction}
+
+    [출력 형식 절대 규칙]:
+    1. 먼저 <pre_calc> 와 </pre_calc> 태그 사이에 전체 슬라이드 구성 계획과 핵심 팩트 체크 과정을 요약하십시오.
+    2. 그 다음, 반드시 <json_output> 과 </json_output> 태그 사이에 아래 포맷의 순수 JSON 배열만 출력하십시오. (생략 기호 '...' 절대 사용 금지)
+
+    <pre_calc>
+    여기에 사전 기획 및 팩트 검증 과정을 작성
+    </pre_calc>
+    <json_output>
+    [
+      {{
+        "type": "INTRO",
+        "title": "슬라이드 제목",
+        "content": "• 첫 번째 줄\\n• 두 번째 줄\\n• 세 번째 줄",
+        "script": "성우가 읽을 자연스러운 구어체 내레이션 대본 전체"
+      }},
+      {{
+        "type": "BODY",
+        "title": "본론 슬라이드 1 제목",
+        "content": "• 핵심 내용 1\\n• 핵심 내용 2",
+        "script": "본론 1 상세 설명 내레이션 대본"
+      }}
     ]
-    st.session_state.business_type = st.radio("처분 대상 업종:", biz_choices, key="biz_radio")
+    </json_output>
+    """
 
-    st.markdown("#### ② 위반 쟁점 카테고리 선택")
-    category_choices = [
-        "🛑 [위생/안전/이물] 금속, 벌레 혼입, 식중독균, 위생적 취급기준 위반",
-        "📝 [서류/장부/보고] 품목제조보고 위반, 생산일지 및 원료수불부 허위작성",
-        "🔬 [기준/규격/검사] 성분배합비율 위반, 자가품질검사 미실시",
-        "📋 [기본 표시사항] 필수 정보 누락 및 완전 무표시",
-        "⚠️ [안전/주의 표시] 알레르기, 당알코올 등 소비자 안전 주의문구 누락",
-        "📢 [부당한 표시·광고] 오인·혼동, 허위/과대 광고",
-        "🔍 기타 위반 (직접 입력)"
-    ]
-    selected_cat = st.radio("위반 카테고리:", category_choices, key="cat_radio")
+    payload = []
+    if uploaded_gemini_files:
+        payload.extend(uploaded_gemini_files)
+    if extra_source_text.strip():
+        payload.append(f"[참고 원문/문서 데이터]:\n{extra_source_text}")
+    payload.append(system_prompt)
 
-    if selected_cat == "🔍 기타 위반 (직접 입력)":
-        custom_cat = st.text_input("💡 엑셀에서 집중적으로 검색할 키워드를 직접 입력해 주십시오 (예: 건강진단, 지하수 등):")
-        if custom_cat:
-            selected_cat = custom_cat
+    for attempt in range(3):
+        try:
+            response = model.generate_content(payload, generation_config=generation_config)
+            raw_text = response.text
 
-    if st.button("▶ 5단계: 조항 및 처분기준 조회", type="secondary"):
-        with st.spinner("선택된 업종에 맞는 사내 DB만을 필터링하여 검색 중입니다..."):
-            current_db_data = load_filtered_documents(st.session_state.business_type)
-            
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
-            st.session_state.case_options = [opt.strip() for opt in (PromptTemplate.from_template(CASE_TEMPLATE) | llm | StrOutputParser()).invoke({
-                "db_data": current_db_data,
-                "question": user_question,
-                "selected_direction": selected_dir,
-                "business_type": st.session_state.business_type,
-                "selected_category": selected_cat
-            }).split('\n') if opt.strip() and opt[0].isdigit()]
-            st.session_state.phase = 5
+            pre_calc_match = re.search(r'<pre_calc>(.*?)</pre_calc>', raw_text, re.DOTALL)
+            pre_calc_log = pre_calc_match.group(1).strip() if pre_calc_match else "사전 연산 로그 없음"
 
-# 5단계
-if st.session_state.phase == 5 and st.session_state.case_options:
-    st.markdown("### 📋 5단계: 세부 위반 조항 최종 확인 (위반행위 요약)")
-    st.info("💡 처분 수위가 가장 무겁고 질문 상황에 적합한 조항에 **[⭐ AI 강력 추천]** 마크가 표시되며, 상황 분기(예: 내부/외부용)가 필요한 경우 선택지가 나뉘어 출력됩니다.")
-    selected_case = st.radio("해당 위반 조항:", st.session_state.case_options, key="case_radio")
+            json_match = re.search(r'<json_output>(.*?)</json_output>', raw_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1).strip()
+            else:
+                json_str = raw_text
 
-    if st.button("📄 최종 법무 검토 및 행정처분 리포트 생성", type="primary"):
-        with st.spinner("최종 리포트를 산출하고 있습니다..."):
-            current_db_data = load_filtered_documents(st.session_state.business_type)
-            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0)
-            rag_chain = PromptTemplate.from_template(TEMPLATE) | llm | StrOutputParser()
-            
-            full_response = rag_chain.invoke({
-                "db_data": current_db_data,
-                "question": user_question, 
-                "business_type": st.session_state.business_type,
-                "selected_category": selected_cat,
-                "selected_case": selected_case
-            })
-            
-        st.markdown("### 📊 최종 법무 검토 및 행정처분 리포트")
-        if "---FINAL_REPORT---" in full_response:
-            reasoning_part, report_part = full_response.split("---FINAL_REPORT---", 1)
-            with st.expander("🔍 [참고] AI 교차 검색 로그 및 원문 팩트체크 내역"):
-                st.markdown(reasoning_part.strip())
-            st.markdown(report_part.strip())
+            json_str = re.sub(r'^```json\s*', '', json_str)
+            json_str = re.sub(r'^```\s*', '', json_str)
+            json_str = re.sub(r'\s*```$', '', json_str).strip()
+
+            slides_data = json.loads(json_str)
+            return slides_data, pre_calc_log, None
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(4)
+                continue
+            return None, None, f"AI 기획안 생성 및 JSON 파싱 실패: {e}\n\n[원본 응답]:\n{raw_text if 'raw_text' in locals() else '응답 없음'}"
+
+# ==========================================
+# [8] 메인 애플리케이션 화면 구성
+# ==========================================
+def main():
+    st.markdown(custom_theme_css, unsafe_allow_html=True)
+
+    # 세션 스테이트 초기화
+    for key in ["slides_data", "pre_calc_log", "final_video_bytes", "final_pptx_bytes", "intro_custom_img", "outro_custom_img"]:
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+    st.markdown("<h1>🎬 AI 교육 영상 & PPT 원스톱 자동화 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(연세유업 품질안전부문 전용)</span></h1>", unsafe_allow_html=True)
+    st.markdown("원본 교육 영상/문서 또는 주제만 입력하면 **[부문장님 당부 말씀 ➡️ 본 교육 PPT/대본 ➡️ 이벤트 안내 ➡️ MP4 영상 병합]**까지 한 번에 완성합니다.")
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # --- 사이드바 설정 ---
+    with st.sidebar:
+        st.header("⚙️ 엔진 및 기본 설정")
+        selected_model = st.selectbox(
+            "사용할 Gemini 모델 선택",
+            ["gemini-3.8-flash", "gemini-omni-1.2-flash", "gemini-2.5-flash", "gemini-4-argon"],
+            index=0,
+            help="일반 기획 및 영상 분석에는 고속 모델인 gemini-3.8-flash 또는 omni-1.2-flash를 권장합니다."
+        )
+        body_slide_count = st.slider("본론(핵심 교육) 슬라이드 장수", min_value=2, max_value=12, value=4, step=1)
+        st.markdown("---")
+        st.info("💡 **작동 순서 안내**\n1. **[탭 1]**에서 인트로(당부말씀), 본론 자료, 아웃트로(이벤트)를 설정하고 기획안을 생성합니다.\n2. **[탭 2]**에서 생성된 슬라이드 텍스트와 더빙 대본을 눈으로 확인 및 수정합니다.\n3. **[탭 3]**에서 버튼 하나로 PPTX 파일과 MP4 교육 영상을 렌더링하여 다운로드합니다.")
+
+    tab1, tab2, tab3 = st.tabs([
+        "1. 교육 자료 입력 및 AI 대본 기획",
+        "2. 슬라이드 & 대본 검수/수정 (컨펌용)",
+        "3. PPTX 및 MP4 교육 영상 렌더링"
+    ])
+
+    # ==========================================
+    # 탭 1: 입력 및 기획안 생성
+    # ==========================================
+    with tab1:
+        st.markdown("### Step 1. 교육 주제 및 본론 원본 자료 입력")
+        col_t1, col_t2 = st.columns([1, 1])
+        with col_t1:
+            topic = st.text_input("이번 교육의 핵심 주제 (필수):", value="영업장 위생 관리 및 교차오염 방지 수칙")
+            source_mode = st.radio(
+                "본론 제작 방식 선택:",
+                ["주제만 입력하여 AI 팩트 기반 자동 기획", "참고 영상(MP4) 또는 문서(PPTX/PDF) 업로드 기반 기획"],
+                index=0
+            )
+        with col_t2:
+            uploaded_source_files = []
+            if "업로드" in source_mode:
+                uploaded_source_files = st.file_uploader(
+                    "참고할 원본 교육 영상(MP4) 또는 문서(PDF, PPTX) 업로드 (복수 가능):",
+                    type=["mp4", "pdf", "pptx", "png", "jpg", "jpeg"],
+                    accept_multiple_files=True
+                )
+            extra_source_text = st.text_area("추가 반영할 사내 기준/핵심 키워드 (선택사항):", height=90, placeholder="예: 작업장 온도 15℃ 이하 유지, 알코올 소독액 70% 사용 등 반드시 포함할 수치나 내용을 적어주세요.")
+
+        st.markdown("---")
+
+        # --- 인트로 설정 (4대 부문장 당부 말씀) ---
+        st.markdown("### Step 2. 오프닝: 4대 부문장님 당부 말씀 설정 (Slide 1)")
+        intro_mode = st.radio(
+            "당부 말씀 구성 방식:",
+            ["AI 자동 생성 (4대 부문장 맞춤형)", "확정된 PPT/텍스트 직접 반영 (공장장님 컨펌본)", "인트로 생략"],
+            horizontal=True
+        )
+
+        intro_custom_text = ""
+        if intro_mode == "확정된 PPT/텍스트 직접 반영 (공장장님 컨펌본)":
+            col_i1, col_i2 = st.columns(2)
+            with col_i1:
+                intro_pptx_file = st.file_uploader("컨펌받은 당부 말씀 PPTX 파일 업로드 (자동 텍스트 추출):", type=["pptx"], key="intro_pptx")
+                if intro_pptx_file:
+                    extracted_intro = extract_text_from_pptx(intro_pptx_file)
+                    st.success("PPTX 텍스트 추출 완료!")
+                else:
+                    extracted_intro = "• 공장장: 기본 안전 수칙 준수가 최우선입니다.\n• 상온부문장: 멸균 공정 모니터링을 철저히 해주세요.\n• 유제품부문장: 냉장 온도 관리를 생활화합시다.\n• 품질안전부문장: 타협 없는 위생 관리를 당부드립니다."
+
+                intro_custom_text = st.text_area("당부 말씀 원문 (직접 수정 가능):", value=extracted_intro, height=130)
+
+            with col_i2:
+                intro_img_file = st.file_uploader("또는 PPT 슬라이드 캡처 이미지(PNG/JPG) 직접 업로드 (선택):", type=["png", "jpg", "jpeg"], key="intro_img", help="업로드 시 AI가 그린 배경 대신 이 이미지가 영상 첫 화면으로 그대로 사용됩니다.")
+                if intro_img_file:
+                    st.session_state["intro_custom_img"] = intro_img_file.getvalue()
+                    st.image(intro_img_file, caption="적용될 인트로 슬라이드 화면", use_container_width=True)
+                else:
+                    st.session_state["intro_custom_img"] = None
+
+        st.markdown("---")
+
+        # --- 아웃트로 설정 (이벤트 안내) ---
+        st.markdown("### Step 3. 클로징: 교육 이벤트 안내 설정 (마지막 Slide)")
+        include_outro = st.checkbox("마지막 슬라이드에 이벤트/퀴즈 안내 포함하기", value=True)
+        outro_text = ""
+        if include_outro:
+            col_o1, col_o2 = st.columns(2)
+            with col_o1:
+                outro_pptx_file = st.file_uploader("이벤트 안내 PPTX 파일 업로드 (선택):", type=["pptx"], key="outro_pptx")
+                default_outro = extract_text_from_pptx(outro_pptx_file) if outro_pptx_file else "• 참여 방법: 사내 게시판(또는 QR코드)을 통해 퀴즈 3문항 제출\n• 참여 기간: 금주 금요일 17시까지\n• 경품 안내: 만점자 추첨을 통해 소정의 상품 증정!"
+                outro_text = st.text_area("이벤트 안내 문구 입력:", value=default_outro, height=110)
+            with col_o2:
+                outro_img_file = st.file_uploader("이벤트 슬라이드 캡처 이미지(PNG/JPG) 직접 업로드 (선택):", type=["png", "jpg", "jpeg"], key="outro_img")
+                if outro_img_file:
+                    st.session_state["outro_custom_img"] = outro_img_file.getvalue()
+                    st.image(outro_img_file, caption="적용될 이벤트 슬라이드 화면", use_container_width=True)
+                else:
+                    st.session_state["outro_custom_img"] = None
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.button("🚀 Step 1~3 통합 AI 슬라이드 & 더빙 대본 기획 시작", type="primary", use_container_width=True):
+            if not API_KEY:
+                st.error("API 키가 설정되지 않았습니다. Streamlit Secrets에 GEMINI_API_KEY를 등록해주세요.")
+            elif not topic.strip():
+                st.warning("교육 주제를 입력해주세요.")
+            else:
+                with st.spinner("원본 자료 분석 및 맞춤형 슬라이드/대본을 기획 중입니다... (영상 포함 시 약 30초~1분 소요)"):
+                    uploaded_gemini_files = []
+                    combined_extra_text = extra_source_text
+
+                    # 업로드된 참고 파일 처리 (PPTX는 텍스트로 즉시 추출하여 토큰 절약, MP4/PDF는 Gemini 서버로 업로드)
+                    for f in uploaded_source_files:
+                        ext = os.path.splitext(f.name)[1].lower()
+                        if ext == ".pptx":
+                            pptx_txt = extract_text_from_pptx(f)
+                            combined_extra_text += f"\n\n[업로드된 PPTX ({f.name}) 추출 내용]:\n{pptx_txt}"
+                        else:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                                tmp.write(f.getbuffer())
+                                tmp_path = tmp.name
+                            up_file = genai.upload_file(tmp_path)
+                            while up_file.state.name == "PROCESSING":
+                                time.sleep(2)
+                                up_file = genai.get_file(up_file.name)
+                            uploaded_gemini_files.append(up_file)
+
+                    intro_cfg = {"mode": intro_mode, "custom_text": intro_custom_text}
+                    outro_cfg = {"include": include_outro, "text": outro_text}
+
+                    slides, pre_log, err = generate_ai_storyboard(
+                        selected_model, topic, body_slide_count, intro_cfg, outro_cfg, uploaded_gemini_files, combined_extra_text
+                    )
+
+                    if err:
+                        st.error(err)
+                    else:
+                        # 사용자가 직접 업로드한 인트로/아웃트로 이미지가 있으면 슬라이드 데이터에 매핑
+                        if slides and st.session_state.get("intro_custom_img") and slides[0].get("type") == "INTRO":
+                            slides[0]["custom_image_bytes"] = st.session_state["intro_custom_img"]
+                        if slides and st.session_state.get("outro_custom_img") and slides[-1].get("type") == "OUTRO":
+                            slides[-1]["custom_image_bytes"] = st.session_state["outro_custom_img"]
+
+                        st.session_state["slides_data"] = slides
+                        st.session_state["pre_calc_log"] = pre_log
+                        st.session_state["final_video_bytes"] = None
+                        st.session_state["final_pptx_bytes"] = None
+                        st.success(f"총 {len(slides)}장의 슬라이드 화면 및 더빙 대본 기획이 완료되었습니다! 상단의 [2. 슬라이드 & 대본 검수/수정] 탭으로 이동하세요.")
+
+    # ==========================================
+    # 탭 2: 슬라이드 & 대본 검수 및 실시간 수정
+    # ==========================================
+    with tab2:
+        if not st.session_state.get("slides_data"):
+            st.info("먼저 [1. 교육 자료 입력 및 AI 대본 기획] 탭에서 기획안을 생성해 주십시오.")
         else:
-            st.markdown(full_response)
+            st.markdown("### 📝 슬라이드별 화면 텍스트 및 성우 내레이션 검수")
+            st.caption("공장장님 보고 전이나 영상 렌더링 전에 오탈자, 수치, 당부 말씀 문구를 자유롭게 수정할 수 있습니다. 수정하신 내용은 PPTX와 MP4 영상에 100% 그대로 반영됩니다.")
+
+            if st.session_state.get("pre_calc_log"):
+                with st.expander("🕵️‍♂️ [AI 시스템 로그] 사전 연산(CoT) 기획 의도 확인하기"):
+                    st.markdown(st.session_state["pre_calc_log"])
+
+            updated_slides = []
+            for idx, slide in enumerate(st.session_state["slides_data"]):
+                s_type = slide.get("type", "BODY")
+                badge = "👔 [오프닝 - 부문장 당부 말씀]" if s_type == "INTRO" else ("🎁 [클로징 - 이벤트 안내]" if s_type == "OUTRO" else f"📘 [본론 교육 {idx}]")
+
+                with st.expander(f"슬라이드 {idx + 1}: {badge} - {slide.get('title', '')}", expanded=True):
+                    col_e1, col_e2 = st.columns([1, 1])
+                    with col_e1:
+                        new_title = st.text_input(f"슬라이드 {idx+1} 제목", value=slide.get("title", ""), key=f"title_{idx}")
+                        new_content = st.text_area(f"PPT 화면 표시 텍스트 (줄바꿈 유지)", value=slide.get("content", ""), height=140, key=f"content_{idx}")
+                    with col_e2:
+                        new_script = st.text_area(f"성우 음성 더빙 대본 (구어체)", value=slide.get("script", ""), height=140, key=f"script_{idx}")
+                        custom_slide_img = st.file_uploader(f"이 슬라이드만 별도 이미지(PPT 캡처본)로 교체 (선택)", type=["png", "jpg", "jpeg"], key=f"custom_img_{idx}")
+
+                    current_img_bytes = custom_slide_img.getvalue() if custom_slide_img else slide.get("custom_image_bytes")
+
+                    updated_slides.append({
+                        "type": s_type,
+                        "title": new_title,
+                        "content": new_content,
+                        "script": new_script,
+                        "custom_image_bytes": current_img_bytes
+                    })
+
+            st.session_state["slides_data"] = updated_slides
+            st.success("✅ 위에 입력된 수정 사항이 실시간으로 메모리에 반영되었습니다. 이제 [3. PPTX 및 MP4 교육 영상 렌더링] 탭으로 이동하세요.")
+
+    # ==========================================
+    # 탭 3: PPTX 및 MP4 영상 병렬 렌더링 및 다운로드
+    # ==========================================
+    with tab3:
+        if not st.session_state.get("slides_data"):
+            st.info("먼저 [1. 교육 자료 입력 및 AI 대본 기획] 탭에서 기획안을 생성해 주십시오.")
+        else:
+            st.markdown("### 🎬 최종 결과물 생성 (PPTX 문서 + MP4 교육 영상)")
+            slides_to_render = st.session_state["slides_data"]
+            st.write(f"현재 총 **{len(slides_to_render)}장**의 슬라이드(오프닝/본론/클로징 포함)가 렌더링 대기 중입니다.")
+
+            col_btn1, col_btn2 = st.columns(2)
+
+            with col_btn1:
+                if st.button("📊 1단계: 편집 가능한 파워포인트(.pptx) 즉시 생성", use_container_width=True):
+                    with st.spinner("실무 수정 및 보고용 PPTX 파일을 생성하고 있습니다..."):
+                        pptx_bytes = generate_editable_pptx(slides_to_render)
+                        st.session_state["final_pptx_bytes"] = pptx_bytes
+                        st.success("파워포인트(.pptx) 생성 완료! (발표자 노트에 대본이 함께 들어있습니다)")
+
+                if st.session_state.get("final_pptx_bytes"):
+                    st.download_button(
+                        label="📥 파워포인트(.pptx) 파일 다운로드",
+                        data=st.session_state["final_pptx_bytes"],
+                        file_name=f"연세유업_교육자료_{datetime.date.today().strftime('%Y%m%d')}.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True
+                    )
+
+            with col_btn2:
+                if st.button("🎥 2단계: 음성 합성 및 MP4 교육 영상 렌더링 시작", type="primary", use_container_width=True):
+                    t_start = time.time()
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        total_cnt = len(slides_to_render)
+                        progress_bar = st.progress(0, text="병렬 엔진 가동: 슬라이드 이미지 및 성우 음성(TTS) 동시 생성 중...")
+
+                        # 1. 병렬 처리(ThreadPoolExecutor)로 슬라이드 이미지 + TTS 오디오 고속 생성
+                        media_results = [None] * total_cnt
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            futures = [
+                                executor.submit(media_worker, idx, slide, total_cnt, temp_dir)
+                                for idx, slide in enumerate(slides_to_render)
+                            ]
+                            completed = 0
+                            for future in as_completed(futures):
+                                idx, img_p, aud_p = future.result()
+                                media_results[idx] = (img_p, aud_p)
+                                completed += 1
+                                progress_bar.progress(
+                                    completed / (total_cnt + 1),
+                                    text=f"({completed}/{total_cnt}) 슬라이드 화면 및 음성 파일 생성 완료..."
+                                )
+
+                        # 2. MoviePy + FFmpeg를 이용한 비디오 클립 병합
+                        progress_bar.progress(total_cnt / (total_cnt + 1), text="최종 MP4 비디오 렌더링 중입니다 (오디오 길이에 맞춰 화면 동기화 중)...")
+                        video_clips = []
+                        audio_clips = []
+                        try:
+                            for img_path, audio_path in media_results:
+                                a_clip = AudioFileClip(audio_path)
+                                # 슬라이드 전환 시 너무 급하게 넘어가지 않도록 오디오 끝에 0.5초 여유 부여
+                                i_clip = ImageClip(img_path).set_duration(a_clip.duration + 0.5)
+                                v_clip = i_clip.set_audio(a_clip)
+                                video_clips.append(v_clip)
+                                audio_clips.append(a_clip)
+
+                            final_video = concatenate_videoclips(video_clips, method="compose")
+                            output_mp4_path = os.path.join(temp_dir, "final_education.mp4")
+
+                            # 정지 화면 위주의 교육 영상에 최적화된 초고속 렌더링 옵션 적용 (fps=10, ultrafast)
+                            final_video.write_videofile(
+                                output_mp4_path,
+                                fps=10,
+                                codec="libx264",
+                                audio_codec="aac",
+                                preset="ultrafast",
+                                threads=4,
+                                logger=None
+                            )
+
+                            with open(output_mp4_path, "rb") as f:
+                                st.session_state["final_video_bytes"] = f.read()
+
+                        finally:
+                            for c in video_clips:
+                                try: c.close()
+                                except: pass
+                            for a in audio_clips:
+                                try: a.close()
+                                except: pass
+
+                        progress_bar.empty()
+                        st.success(f"🎉 교육 영상 렌더링 완료! (총 소요시간: {time.time() - t_start:.1f}초)")
+
+            if st.session_state.get("final_video_bytes"):
+                st.markdown("---")
+                st.markdown("#### 📺 완성된 교육 영상 미리보기 및 다운로드")
+                st.video(st.session_state["final_video_bytes"])
+                st.download_button(
+                    label="📥 완성된 MP4 교육 영상 다운로드",
+                    data=st.session_state["final_video_bytes"],
+                    file_name=f"연세유업_교육영상_{datetime.date.today().strftime('%Y%m%d')}.mp4",
+                    mime="video/mp4",
+                    type="primary",
+                    use_container_width=True
+                )
+
+if __name__ == "__main__":
+    if check_password():
+        main()
