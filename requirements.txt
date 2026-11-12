@@ -1,11 +1,6 @@
-streamlit==1.38.0
-langchain==0.3.0
-langchain-google-genai==2.0.0
-langchain-community==0.3.0
-langchain-text-splitters==0.3.0
-faiss-cpu==1.8.0
-pypdf==4.3.1
-pandas==2.2.2
-openpyxl==3.1.5
-sentence-transformers==3.0.1
-tabulate
+streamlit
+google-generativeai
+gTTS
+Pillow
+moviepy==1.0.3
+python-pptx
