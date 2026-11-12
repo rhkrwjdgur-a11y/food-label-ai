@@ -1602,12 +1602,16 @@ if "PPTX 업로드" in intro_mode:
                                     {"header": "품질안전부문", "sub": "품질안전부문장", "body": ldr_qc}
                                 ]
 
-                        # 병렬로 슬라이드 시각 일러스트/영상 프레임 채우기
+# [수정 핵심] 서브 스레드 진입 전, 메인 스레드에서 st.session_state 값을 일반 변수로 미리 추출!
+                        local_video_path = st.session_state.get("uploaded_video_local_path")
+                        local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
+
+                        # 병렬로 슬라이드 시각 일러스트/영상 프레임 채우기 (내부에서 st.session_state 호출 절대 금지)
                         def _fill_visual(idx_s, s_obj):
                             if s_obj.get("layout") in ("SPLIT_VISUAL", "COVER") and not s_obj.get("visual_bytes"):
                                 ts = s_obj.get("video_timestamp_sec")
-                                if ts is not None and st.session_state.get("uploaded_video_local_path"):
-                                    fb = capture_frame_from_video(st.session_state["uploaded_video_local_path"], ts)
+                                if ts is not None and local_video_path:
+                                    fb = capture_frame_from_video(local_video_path, ts)
                                     if fb:
                                         s_obj["visual_bytes"] = fb
                                         return idx_s, s_obj
@@ -1618,7 +1622,7 @@ if "PPTX 업로드" in intro_mode:
                                         theme_mode,
                                         openai_key=openai_key_input,
                                         gemini_key=GEMINI_API_KEY,
-                                        custom_font_paths=st.session_state["custom_font_paths"]
+                                        custom_font_paths=local_custom_fonts
                                     )
                             return idx_s, s_obj
 
@@ -1767,7 +1771,8 @@ if "PPTX 업로드" in intro_mode:
                         total_cnt = len(slides_to_render)
                         p_bar = st.progress(0, text="병렬 엔진 가동: Full-HD 슬라이드 및 자연스러운 성우 오디오 동시 합성 중...")
 
-                        media_results = [None] * total_cnt
+                      media_results = [None] * total_cnt
+                        local_leader_photos = dict(st.session_state.get("leader_photos", {}))
                         with ThreadPoolExecutor(max_workers=4) as executor:
                             futures = [
                                 executor.submit(
@@ -1779,7 +1784,7 @@ if "PPTX 업로드" in intro_mode:
                                     font_config,
                                     theme_mode,
                                     tts_config,
-                                    st.session_state["leader_photos"]
+                                    local_leader_photos
                                 )
                                 for idx, s_data in enumerate(slides_to_render)
                             ]
