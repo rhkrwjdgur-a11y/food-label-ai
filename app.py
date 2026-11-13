@@ -1454,12 +1454,12 @@ def main():
 
         st.markdown("---")
 
-        # --- Step 2: 당부 말씀 (얼굴 사진 자동 추출 & 슬라이드 이미지 직행 모두 지원) ---
+        # --- Step 2: 당부 말씀 (얼굴 사진 깃허브 고정 & 슬라이드 이미지 직행 모두 지원) ---
         st.markdown("### 👔 Step 2. 오프닝: 월간 위생교육 전 당부말씀 (상단 생산본부장 + 하단 3부문장 & 얼굴 사진 연동)")
         intro_mode = st.radio(
             "당부 말씀 적용 방식:",
             [
-                "PPTX 업로드 또는 텍스트 입력 (부문장님 얼굴 사진 자동 추출 + 상단1·하단3 표준 레이아웃 렌더링)",
+                "PPTX 업로드 또는 텍스트 입력 (부문장님 얼굴 사진 깃허브 고정 + 상단1·하단3 표준 레이아웃 렌더링)",
                 "당부 말씀 슬라이드 완성본 이미지/PDF 통째로 올리기 (원본 슬라이드 그림 100% 그대로 사용)",
                 "당부 말씀 슬라이드 생략"
             ]
@@ -1468,7 +1468,7 @@ def main():
         intro_custom_text = ""
         ldr_prod = ldr_dairy = ldr_ambient = ldr_qc = ""
 
-if "PPTX 업로드" in intro_mode:
+        if "PPTX 업로드" in intro_mode:
             st.session_state["intro_full_slide_bytes"] = None
             # 깃허브 고정 사진이 비어있다면 다시 한 번 스캔하여 항상 고정 유지
             if not st.session_state.get("leader_photos"):
@@ -1479,6 +1479,7 @@ if "PPTX 업로드" in intro_mode:
             if leader_pptx:
                 parsed_leaders = parse_leader_pptx_text_only(leader_pptx)
                 st.success("PPTX에서 4분의 당부 말씀 텍스트만 깔끔하게 추출했습니다! (프로필 사진은 깃허브 원본 고정)")
+
             default_prod = parsed_leaders.get("생산본부") or "일교차가 커지면서 외부 해충이나 이물질이 따뜻한 실내 작업장으로 유입되기 쉬워 각별한 주의가 필요한 시기입니다. 우리 연세유업 아산공장의 흔들림 없는 식품 안전은 결국 현장에 계신 여러분의 빈틈없는 이물 관리와 밀폐 수칙 준수에서 시작됩니다. 현장에 정착된 철저한 HACCP 실행력을 바탕으로 위해요소를 사전에 100% 차단하는 든든한 방어선 역할을 해 주시길 당부 드립니다."
             default_dairy = parsed_leaders.get("유제품생산부문") or "유제품은 미생물과 주변 환경변화에 매우 민감한 특성을 가지고 있습니다. 공장 천정, 덕트, 배관 표면 등에 결로가 발생하면 곰팡이 증식 조건이 되므로 작업장 환경 청소와 철저한 건조 관리에 많은 관심이 필요합니다. 일일 건강 모니터링도 철저히 실천해 주시기 바랍니다."
             default_ambient = parsed_leaders.get("상온제품생산부문") or "상온제품의 안전성을 책임지는 핵심은 멸균 온도 관리와 여과망 점검 등 철저한 CCP 모니터링에 있습니다. 각 공정의 한계기준을 명확히 숙지하고 이탈 시 즉각적인 조치가 이루어질 수 있도록 만전을 기해 주십시오. 완벽한 CCP 점검과 작업장 밀폐를 당부드립니다."
@@ -1602,7 +1603,7 @@ if "PPTX 업로드" in intro_mode:
                                     {"header": "품질안전부문", "sub": "품질안전부문장", "body": ldr_qc}
                                 ]
 
-# [수정 핵심] 서브 스레드 진입 전, 메인 스레드에서 st.session_state 값을 일반 변수로 미리 추출!
+                        # [수정 핵심] 서브 스레드 진입 전, 메인 스레드에서 st.session_state 값을 일반 변수로 미리 추출!
                         local_video_path = st.session_state.get("uploaded_video_local_path")
                         local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
 
@@ -1771,7 +1772,7 @@ if "PPTX 업로드" in intro_mode:
                         total_cnt = len(slides_to_render)
                         p_bar = st.progress(0, text="병렬 엔진 가동: Full-HD 슬라이드 및 자연스러운 성우 오디오 동시 합성 중...")
 
-                      media_results = [None] * total_cnt
+                        media_results = [None] * total_cnt
                         local_leader_photos = dict(st.session_state.get("leader_photos", {}))
                         with ThreadPoolExecutor(max_workers=4) as executor:
                             futures = [
