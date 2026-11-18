@@ -1400,7 +1400,7 @@ def main():
     # --- 좌측 사이드바 ---
     with st.sidebar:
         st.header("🧠 고정 AI 엔진 상태")
-       key_type_label = "Gemini Developer API"
+        key_type_label = "Gemini Developer API"
         st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·대본:** `{PLANNING_MODEL}`\n• **맞춤 도면·영상:** `{VISUAL_OMNI_MODEL}`")
 
         st.markdown("---")
