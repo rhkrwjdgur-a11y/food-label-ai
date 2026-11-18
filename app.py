@@ -404,20 +404,29 @@ def extract_pages_from_pdf(pdf_bytes):
 
 def build_inline_video_part(video_path):
     """
-    Vertex AI(AQ. 키) 환경에서 upload_file() 에러 없이 대용량 MP4의 화면 텍스트와 음성을 모두 분석하기 위해
-    15MB 초과 영상은 ffmpeg로 초경량 변환 후 Part.from_bytes로 직접 전달합니다.
+    시스템 PATH에 ffmpeg가 없더라도 moviepy 내장 imageio_ffmpeg 실행 파일을 자동 연결하여
+    15MB 초과 영상을 경량 변환 후 Part.from_bytes로 전달합니다.
     """
+    import shutil
     raw_size = os.path.getsize(video_path)
     if raw_size <= 15 * 1024 * 1024:
         with open(video_path, "rb") as rf:
             return types.Part.from_bytes(data=rf.read(), mime_type="video/mp4")
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            raise RuntimeError(f"내장 ffmpeg 실행 파일을 찾을 수 없습니다: {e}")
 
     compressed_mp4 = video_path + "_slim.mp4"
     compressed_mp3 = video_path + "_slim.mp3"
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", video_path,
+                ffmpeg_bin, "-y", "-i", video_path,
                 "-vf", "fps=0.5,scale=640:-2",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
                 "-ac", "1", "-ar", "16000", "-b:a", "32k",
@@ -433,7 +442,7 @@ def build_inline_video_part(video_path):
 
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", video_path,
+                ffmpeg_bin, "-y", "-i", video_path,
                 "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
                 compressed_mp3
             ],
