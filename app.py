@@ -88,8 +88,7 @@ DEFAULT_OPENAI_KEY = (
 def get_genai_client(api_key):
     if not api_key:
         return None
-    is_vertex_key = api_key.startswith("AQ.")
-    return genai.Client(vertexai=is_vertex_key, api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 # ==========================================
 # [4] 커스텀 CSS
@@ -1401,7 +1400,7 @@ def main():
     # --- 좌측 사이드바 ---
     with st.sidebar:
         st.header("🧠 고정 AI 엔진 상태")
-        key_type_label = "Vertex AI (AQ. 키)" if GEMINI_API_KEY.startswith("AQ.") else "표준 Gemini API"
+       key_type_label = "Gemini Developer API"
         st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·대본:** `{PLANNING_MODEL}`\n• **맞춤 도면·영상:** `{VISUAL_OMNI_MODEL}`")
 
         st.markdown("---")
