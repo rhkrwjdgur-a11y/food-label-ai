@@ -47,7 +47,7 @@ socket.setdefaulttimeout(600)
 
 # 고정 AI 모델 상수
 PLANNING_MODEL = "gemini-3.8-flash"
-VISUAL_OMNI_MODEL = "gemini-omni-1.2-flash"
+VISUAL_OMNI_MODEL = "gemini-3.1-flash-image"
 
 # ==========================================
 # [2] 보안 접속 설정 (비밀번호: 2082)
@@ -256,8 +256,9 @@ def load_pil_font(font_choice, size, is_bold=False, custom_font_paths=None):
 def wrap_text_by_pixel(text, font, max_width, draw):
     if not text:
         return []
+    cleaned_text = str(text).replace("•", "-").replace("▸", "-").replace("▪", "-")
     lines = []
-    for paragraph in str(text).split('\n'):
+    for paragraph in cleaned_text.split('\n'):
         paragraph = paragraph.strip()
         if not paragraph:
             lines.append("")
@@ -568,40 +569,51 @@ def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=Non
 
 def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key="", gemini_key="", custom_font_paths=None):
     """
-    1순위: google-genai 클라이언트로 gemini-omni-1.2-flash 호출하여 슬라이드 내용 맞춤 1:1 도면 생성
+    1순위: google-genai 클라이언트로 gemini-3.1-flash-image 등 정식 이미지 생성 모델 순차 호출
     2순위: OpenAI 키 보유 시 DALL-E 3 보조 호출
-    3순위: 슬라이드 카드 내용을 도식화한 고해상도 인포그래픽 다이어그램 자동 작도
+    3순위: 모든 외부 API 응답 실패 시에만 인포그래픽 다이어그램 작도
     """
     tailored_prompt = build_tailored_visual_prompt(slide_obj, fallback_topic=fallback_topic)
     style_prefix = (
-        "Clean isometric 3D food factory hygiene & equipment technical illustration on a soft light architectural blueprint background, "
+        "Generate a clean isometric 3D food factory hygiene & equipment technical illustration on a soft light architectural blueprint background, "
         "showing the exact equipment, facility layout, and hygiene actions described below. "
         "Full view centered inside frame with generous margins, strictly NO text, NO letters, NO numbers inside the image. "
         if "10월" in theme_style else
-        "Modern dark navy cybernetic isometric 3D food safety engineering illustration with glowing emerald and cyan accents, "
+        "Generate a modern dark navy cybernetic isometric 3D food safety engineering illustration with glowing emerald and cyan accents, "
         "showing the exact equipment, facility layout, and hygiene actions described below. "
         "Full view centered inside frame with generous margins, strictly NO text, NO letters, NO numbers inside the image. "
     )
     full_prompt = style_prefix + tailored_prompt
 
-    # 1) google-genai 클라이언트 기반 gemini-omni-1.2-flash 호출 (AQ. 키 완벽 호환)
+    # 1) Gemini 정식 이미지 생성 모델 순차 호출 (속도 제한 시 자동 재시도 포함)
     if gemini_key:
-        try:
-            client = get_genai_client(gemini_key)
-            resp = client.models.generate_content(
-                model=VISUAL_OMNI_MODEL,
-                contents=full_prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=["TEXT", "IMAGE"]
-                )
-            )
-            if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
-                for part in resp.candidates[0].content.parts:
-                    if part.inline_data and part.inline_data.data:
-                        data_val = part.inline_data.data
-                        return base64.b64decode(data_val) if isinstance(data_val, str) else data_val
-        except Exception:
-            pass
+        client = get_genai_client(gemini_key)
+        candidate_models = [
+            VISUAL_OMNI_MODEL,
+            "gemini-3.1-flash-lite-image",
+            "gemini-2.5-flash-image"
+        ]
+        for img_model in candidate_models:
+            for retry_idx in range(2):
+                try:
+                    resp = client.models.generate_content(
+                        model=img_model,
+                        contents=full_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["TEXT", "IMAGE"]
+                        )
+                    )
+                    if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+                        for part in resp.candidates[0].content.parts:
+                            if part.inline_data and part.inline_data.data:
+                                data_val = part.inline_data.data
+                                return base64.b64decode(data_val) if isinstance(data_val, str) else data_val
+                    break
+                except Exception as e:
+                    if "429" in str(e) and retry_idx == 0:
+                        time.sleep(3)
+                        continue
+                    break
 
     # 2) OpenAI DALL-E 3 보조 호출
     if openai_key:
