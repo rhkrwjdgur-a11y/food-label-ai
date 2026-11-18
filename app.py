@@ -1,6 +1,8 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
 import tempfile
 import asyncio
 import base64
@@ -15,7 +17,7 @@ import re
 import datetime
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, concatenate_videoclips
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -43,6 +45,10 @@ except ImportError:
 st.set_page_config(page_title="연세유업 AI 위생교육 스튜디오", layout="wide")
 socket.setdefaulttimeout(600)
 
+# 고정 AI 모델 상수
+PLANNING_MODEL = "gemini-3.8-flash"
+VISUAL_OMNI_MODEL = "gemini-omni-1.2-flash"
+
 # ==========================================
 # [2] 보안 접속 설정 (비밀번호: 2082)
 # ==========================================
@@ -63,22 +69,27 @@ def check_password():
         return True
 
 # ==========================================
-# [3] API 키 로드
+# [3] API 키 로드 및 Vertex AI(AQ.) / 표준(AIza) 자동 호환 클라이언트
 # ==========================================
 GEMINI_API_KEY = (
     st.secrets.get("GEMINI_API_KEY")
     or st.secrets.get("GOOGLE_API_KEY")
     or os.environ.get("GEMINI_API_KEY")
     or os.environ.get("GOOGLE_API_KEY")
-)
+    or ""
+).strip().strip('"').strip("'")
+
 DEFAULT_OPENAI_KEY = (
     st.secrets.get("OPENAI_API_KEY")
     or os.environ.get("OPENAI_API_KEY")
     or ""
-)
+).strip().strip('"').strip("'")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+def get_genai_client(api_key):
+    if not api_key:
+        return None
+    is_vertex_key = api_key.startswith("AQ.")
+    return genai.Client(vertexai=is_vertex_key, api_key=api_key)
 
 # ==========================================
 # [4] 커스텀 CSS
@@ -184,7 +195,6 @@ def find_font_file(font_choice, is_bold=False, custom_font_paths=None):
 
     info = FONT_SEARCH_MAP.get(font_choice, FONT_SEARCH_MAP["맑은고딕"])
 
-    # 맑은고딕 굵기 우선 분기
     if font_choice == "맑은고딕":
         target_files = ["malgunbd.ttf", "MalgunGothicBold.ttf"] if is_bold else ["malgun.ttf", "맑은고딕.ttf", "MalgunGothic.ttf"]
         for d in FONT_SEARCH_DIRS:
@@ -193,14 +203,12 @@ def find_font_file(font_choice, is_bold=False, custom_font_paths=None):
                 if os.path.exists(cand):
                     return cand
 
-    # 깃허브 font/ 폴더 내 정확한 파일명 매칭
     for d in FONT_SEARCH_DIRS:
         for exact_name in info["exact_names"]:
             cand = os.path.join(d, exact_name) if d != "." else exact_name
             if os.path.exists(cand):
                 return cand
 
-    # 깃허브 font/ 폴더 내 부분 키워드 스캔 (파일명이 조금 달라도 자동 인식)
     for d in FONT_SEARCH_DIRS:
         if os.path.exists(d) and os.path.isdir(d):
             try:
@@ -220,7 +228,6 @@ def find_font_file(font_choice, is_bold=False, custom_font_paths=None):
                             return mf
                 return matched_files[0]
 
-    # 시스템 기본 한글 폰트 폴백 (네모 깨짐 원천 차단)
     system_fallbacks = [
         "C:/Windows/Fonts/malgunbd.ttf" if is_bold else "C:/Windows/Fonts/malgun.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf" if is_bold else "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
@@ -280,7 +287,7 @@ def wrap_text_by_pixel(text, font, max_width, draw):
     return lines
 
 # ==========================================
-# [6] 문서/이미지/리더 프로필 사진 추출 유틸리티
+# [6] 문서/동영상 인라인 변환 및 리더 프로필 사진 유틸리티
 # ==========================================
 def load_default_leader_photos_from_repo():
     """
@@ -295,7 +302,6 @@ def load_default_leader_photos_from_repo():
         "품질안전부문": ["품질안전부문장", "품질부문장", "품질안전", "품질", "오재필", "어성현", "leader4", "4_"]
     }
 
-    # 깃허브 저장소 내 모든 폴더(.git 제외) 자동 탐색
     for root_dir, dirs, files in os.walk("."):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
         for fname in sorted(files):
@@ -349,7 +355,7 @@ def extract_text_and_Media_from_pptx(file_obj):
 def parse_leader_pptx_text_only(file_obj):
     """
     '위생교육 전 말씀.pptx' 파일에서 이미지는 절대 건드리지 않고,
-    오직 4분의 당부 말씀 텍스트만 추출합니다. (깃허브 고정 사진 보호)
+    오직 4분의 당부 말씀 텍스트만 추출합니다. (깃허브 고정 사진 100% 보호)
     """
     raw_text, _ = extract_text_and_Media_from_pptx(file_obj)
     texts = {
@@ -396,26 +402,87 @@ def extract_pages_from_pdf(pdf_bytes):
     doc.close()
     return pages_info
 
-def capture_frame_from_video(video_path, sec):
+def build_inline_video_part(video_path):
+    """
+    Vertex AI(AQ. 키) 환경에서 upload_file() 에러 없이 대용량 MP4의 화면 텍스트와 음성을 모두 분석하기 위해
+    15MB 초과 영상은 ffmpeg로 초경량 변환 후 Part.from_bytes로 직접 전달합니다.
+    """
+    raw_size = os.path.getsize(video_path)
+    if raw_size <= 15 * 1024 * 1024:
+        with open(video_path, "rb") as rf:
+            return types.Part.from_bytes(data=rf.read(), mime_type="video/mp4")
+
+    compressed_mp4 = video_path + "_slim.mp4"
+    compressed_mp3 = video_path + "_slim.mp3"
     try:
-        clip = VideoFileClip(video_path)
-        safe_sec = min(max(0.0, float(sec)), max(0.0, clip.duration - 0.3))
-        frame = clip.get_frame(safe_sec)
-        clip.close()
-        pil_img = Image.fromarray(frame)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception:
-        return None
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", "fps=0.5,scale=640:-2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
+                "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                compressed_mp4
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=180
+        )
+        if os.path.exists(compressed_mp4) and os.path.getsize(compressed_mp4) <= 18 * 1024 * 1024:
+            with open(compressed_mp4, "rb") as rf:
+                return types.Part.from_bytes(data=rf.read(), mime_type="video/mp4")
+
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                compressed_mp3
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120
+        )
+        if os.path.exists(compressed_mp3):
+            with open(compressed_mp3, "rb") as rf:
+                return types.Part.from_bytes(data=rf.read(), mime_type="audio/mpeg")
+    finally:
+        for p in (compressed_mp4, compressed_mp3):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    raise RuntimeError("동영상 용량이 너무 커서 인라인 변환에 실패했습니다.")
 
 # ==========================================
-# [7] 3단계 시각 자료(일러스트/도면) 생성 엔진 (학습자 몰입도 극대화)
+# [7] 슬라이드 내용 맞춤형 시각 도면 생성 엔진 (gemini-omni-1.2-flash 직결)
 # ==========================================
-def generate_procedural_infographic(slide_title, visual_prompt, theme_mode, custom_font_paths=None):
+def build_tailored_visual_prompt(slide_obj, fallback_topic=""):
     """
-    외부 이미지 생성 API가 실패하거나 한도 초과일 때에도 절대 빈 화면이 나오지 않도록,
-    슬라이드 주제를 분석해 고해상도(840x760) 맞춤형 벡터 인포그래픽 도면을 직접 그립니다.
+    슬라이드의 제목과 우측 카드(cards) 소제목·본문 핵심 키워드를 결합하여,
+    해당 슬라이드 내용에 100% 부합하는 구체적인 시각 도면 프롬프트를 조립합니다.
+    """
+    base_vp = str(slide_obj.get("visual_prompt", "")).strip()
+    s_title = str(slide_obj.get("title", fallback_topic)).strip()
+    cards = slide_obj.get("cards", [])
+    card_summary = []
+    for c in cards[:3]:
+        h_txt = str(c.get("header", "")).strip()
+        b_txt = str(c.get("body", "")).replace("\n", " ").strip()[:80]
+        if h_txt or b_txt:
+            card_summary.append(f"[{h_txt}: {b_txt}]")
+    joined_cards = " / ".join(card_summary)
+
+    return (
+        f"Slide Topic: {s_title}. "
+        f"Key Elements to visually depict together in one coherent scene: {joined_cards}. "
+        f"Visual Direction: {base_vp}"
+    )
+
+def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=None):
+    """
+    네트워크 제한 등으로 외부 이미지 생성이 응답하지 않을 때에도,
+    해당 슬라이드의 우측 카드 핵심 키워드들을 직접 도식화하여 맞춤형 기술 다이어그램을 그립니다.
     """
     w, h = 840, 760
     is_light = "10월" in theme_mode
@@ -423,112 +490,112 @@ def generate_procedural_infographic(slide_title, visual_prompt, theme_mode, cust
     accent = (2, 132, 199) if is_light else (16, 185, 129)
     sub_accent = (30, 64, 175) if is_light else (56, 189, 248)
     ink = (30, 41, 59) if is_light else (226, 232, 240)
+    card_fill = (255, 255, 255) if is_light else (19, 36, 62)
 
     img = Image.new("RGB", (w, h), bg_col)
     draw = ImageDraw.Draw(img)
 
-    # 모눈 그리드 배경
     for gx in range(0, w, 35):
         draw.line([(gx, 0), (gx, h)], fill=(216, 228, 242) if is_light else (22, 40, 68), width=1)
     for gy in range(0, h, 35):
         draw.line([(0, gy), (w, gy)], fill=(216, 228, 242) if is_light else (22, 40, 68), width=1)
 
-    f_label = load_pil_font("연세제목체", 28, is_bold=True, custom_font_paths=custom_font_paths)
-    f_sub = load_pil_font("연세본문체", 22, is_bold=False, custom_font_paths=custom_font_paths)
+    f_head = load_pil_font("연세제목체", 27, is_bold=True, custom_font_paths=custom_font_paths)
+    f_node = load_pil_font("연세제목체", 24, is_bold=True, custom_font_paths=custom_font_paths)
+    f_desc = load_pil_font("연세본문체", 20, is_bold=False, custom_font_paths=custom_font_paths)
 
-    combined_kw = f"{slide_title} {visual_prompt}".lower()
-    cx, cy = w // 2, h // 2 - 20
+    s_title = str(slide_obj.get("title", "핵심 위생 관리 도해")).strip()
+    cards = slide_obj.get("cards", [])
 
-    # 외곽 원형 기술 링
-    draw.ellipse([(cx - 240, cy - 240), (cx + 240, cy + 240)], outline=accent, width=4)
-    draw.ellipse([(cx - 210, cy - 210), (cx + 210, cy + 210)], fill=(255, 255, 255) if is_light else (19, 36, 62), outline=sub_accent, width=3)
+    draw.rounded_rectangle([(45, 36), (w - 45, 112)], radius=14, fill=sub_accent)
+    t_lines = wrap_text_by_pixel(f"핵심 공정·위생 도해 | {s_title}", f_head, w - 130, draw)
+    if t_lines:
+        bb = draw.textbbox((0, 0), t_lines[0], font=f_head)
+        draw.text(((w - (bb[2] - bb[0])) // 2, 58), t_lines[0], font=f_head, fill=(255, 255, 255))
 
-    if any(k in combined_kw for k in ["온도", "냉장", "냉동", "살균", "멸균", "센서", "열", "temp", "therm"]):
-        # 온도계 & 센서 파형 다이어그램
-        draw.rounded_rectangle([(cx - 32, cy - 130), (cx + 32, cy + 70)], radius=30, fill=bg_col, outline=sub_accent, width=6)
-        draw.ellipse([(cx - 58, cy + 35), (cx + 58, cy + 150)], fill=(239, 68, 68), outline=sub_accent, width=6)
-        draw.rounded_rectangle([(cx - 14, cy - 65), (cx + 14, cy + 60)], radius=10, fill=(239, 68, 68))
-        for sy in range(cy - 105, cy + 25, 28):
-            draw.line([(cx + 42, sy), (cx + 72, sy)], fill=sub_accent, width=4)
-        tag = "REAL-TIME TEMP & CCP MONITORING"
-    elif any(k in combined_kw for k in ["구역", "동선", "청결", "밀폐", "출입", "문", "벽", "배수", "zone", "flow", "door"]):
-        # 청결구역 vs 일반구역 차단 아키텍처 도면
-        draw.rounded_rectangle([(cx - 155, cy - 110), (cx - 15, cy + 110)], radius=12, fill=(219, 234, 254) if is_light else (12, 74, 110), outline=accent, width=4)
-        draw.rounded_rectangle([(cx + 15, cy - 110), (cx + 155, cy + 110)], radius=12, fill=(241, 245, 249) if is_light else (30, 41, 59), outline=(239, 68, 68), width=4)
-        draw.line([(cx, cy - 145), (cx, cy + 145)], fill=(239, 68, 68), width=7)
-        draw.text((cx - 132, cy - 20), "청결구역", font=f_label, fill=ink)
-        draw.text((cx + 38, cy - 20), "일반구역", font=f_label, fill=ink)
-        tag = "CLEAN ZONE & ACCESS BARRIER"
-    elif any(k in combined_kw for k in ["이물", "금속", "해충", "벌레", "자석", "여과", "필터", "유리", "metal", "pest", "foreign"]):
-        # 다중 여과 & 금속 검출 실드 도면
-        pts = [(cx, cy - 145), (cx + 135, cy - 85), (cx + 110, cy + 75), (cx, cy + 150), (cx - 110, cy + 75), (cx - 135, cy - 85)]
-        draw.polygon(pts, fill=(236, 253, 245) if is_light else (6, 78, 59), outline=accent)
-        draw.line([(cx - 55, cy + 5), (cx - 12, cy + 48), (cx + 68, cy - 42)], fill=accent, width=14)
-        tag = "FOREIGN MATTER DEFENSE SHIELD"
-    else:
-        # 표준 HACCP 위생 관리 체크 인포그래픽
-        draw.rounded_rectangle([(cx - 105, cy - 130), (cx + 105, cy + 130)], radius=18, fill=bg_col, outline=sub_accent, width=5)
-        draw.rounded_rectangle([(cx - 50, cy - 152), (cx + 50, cy - 110)], radius=10, fill=accent)
-        for idx_r, ry in enumerate([cy - 55, cy + 5, cy + 65]):
-            draw.ellipse([(cx - 72, ry - 14), (cx - 44, ry + 14)], fill=accent)
-            draw.line([(cx - 25, ry), (cx + 72, ry)], fill=ink, width=6)
-        tag = "HACCP HYGIENE STANDARD PROTOCOL"
+    node_items = cards[:3] if cards else [{"header": s_title, "body": slide_obj.get("content", ""), "metric": "HACCP"}]
+    n_cnt = len(node_items)
+    start_y = 148
+    box_h = 165 if n_cnt == 3 else 220
+    gap_y = 26
 
-    # 하단 캡션 배너
-    draw.rounded_rectangle([(60, h - 110), (w - 60, h - 38)], radius=12, fill=sub_accent)
-    bb = draw.textbbox((0, 0), tag, font=f_sub)
-    draw.text(((w - (bb[2] - bb[0])) // 2, h - 88), tag, font=f_sub, fill=(255, 255, 255))
+    for idx_n, item in enumerate(node_items):
+        ny1 = start_y + idx_n * (box_h + gap_y)
+        ny2 = ny1 + box_h
+        nx1, nx2 = 55, w - 55
+
+        draw.rounded_rectangle([(nx1 + 4, ny1 + 4), (nx2 + 4, ny2 + 4)], radius=18, fill=(203, 213, 225) if is_light else (6, 12, 24))
+        draw.rounded_rectangle([(nx1, ny1), (nx2, ny2)], radius=18, fill=card_fill, outline=accent, width=3)
+
+        ic_cx, ic_cy, ic_r = nx1 + 72, (ny1 + ny2) // 2, 44
+        draw.ellipse([(ic_cx - ic_r, ic_cy - ic_r), (ic_cx + ic_r, ic_cy + ic_r)], fill=accent, outline=sub_accent, width=3)
+        num_str = f"0{idx_n + 1}"
+        nb = draw.textbbox((0, 0), num_str, font=f_head)
+        draw.text((ic_cx - (nb[2] - nb[0]) // 2, ic_cy - 16), num_str, font=f_head, fill=(255, 255, 255))
+
+        h_str = str(item.get("header", f"핵심 요소 {idx_n + 1}")).strip()
+        m_str = str(item.get("metric", "")).strip()
+        title_line = f"{h_str}  [{m_str}]" if m_str else h_str
+        draw.text((nx1 + 138, ny1 + 24), title_line[:28], font=f_node, fill=sub_accent if is_light else (52, 211, 153))
+
+        raw_b = str(item.get("body", "")).replace("•", "").strip()
+        b_lines = wrap_text_by_pixel(raw_b, f_desc, (nx2 - nx1) - 165, draw)
+        by_cur = ny1 + 68
+        for bl in b_lines[:2]:
+            draw.text((nx1 + 138, by_cur), f"▸ {bl}", font=f_desc, fill=ink)
+            by_cur += 34
+
+        if idx_n < n_cnt - 1:
+            mid_x = w // 2
+            draw.line([(mid_x, ny2), (mid_x, ny2 + gap_y)], fill=sub_accent, width=4)
+
+    draw.rounded_rectangle([(55, h - 78), (w - 55, h - 28)], radius=10, fill=(224, 242, 254) if is_light else (6, 78, 59), outline=accent, width=2)
+    foot_txt = "YONSEI DAIRY FOOD SAFETY VISUAL ARCHITECTURE"
+    fb = draw.textbbox((0, 0), foot_txt, font=f_desc)
+    draw.text(((w - (fb[2] - fb[0])) // 2, h - 65), foot_txt, font=f_desc, fill=sub_accent if is_light else (255, 255, 255))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def generate_ai_illustration(visual_prompt, slide_title, theme_style, openai_key="", gemini_key="", custom_font_paths=None):
+def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key="", gemini_key="", custom_font_paths=None):
     """
-    1차: OpenAI DALL-E 3 (키 보유 및 선택 시) 또는 Gemini Imagen 3 / Multimodal Flash 이미지 생성 호출
-    2차: 실패 시 고해상도 자체 벡터 인포그래픽으로 100% 폴백하여 절대 빈칸이 발생하지 않음
+    1순위: google-genai 클라이언트로 gemini-omni-1.2-flash 호출하여 슬라이드 내용 맞춤 1:1 도면 생성
+    2순위: OpenAI 키 보유 시 DALL-E 3 보조 호출
+    3순위: 슬라이드 카드 내용을 도식화한 고해상도 인포그래픽 다이어그램 자동 작도
     """
+    tailored_prompt = build_tailored_visual_prompt(slide_obj, fallback_topic=fallback_topic)
     style_prefix = (
-        "Clean isometric 3D food factory hygiene technical illustration on a soft light architectural grid background, modern infographic vector art, strictly NO text or letters inside the image: "
+        "Clean isometric 3D food factory hygiene & equipment technical illustration on a soft light architectural blueprint background, "
+        "showing the exact equipment, facility layout, and hygiene actions described below. "
+        "Full view centered inside frame with generous margins, strictly NO text, NO letters, NO numbers inside the image. "
         if "10월" in theme_style else
-        "Modern dark navy cybernetic isometric 3D food safety engineering illustration with glowing emerald and cyan accents, clean vector art, strictly NO text or letters inside the image: "
+        "Modern dark navy cybernetic isometric 3D food safety engineering illustration with glowing emerald and cyan accents, "
+        "showing the exact equipment, facility layout, and hygiene actions described below. "
+        "Full view centered inside frame with generous margins, strictly NO text, NO letters, NO numbers inside the image. "
     )
-    full_prompt = style_prefix + (visual_prompt or slide_title)
+    full_prompt = style_prefix + tailored_prompt
 
-    # 1) Gemini Imagen 3 REST API 시도
+    # 1) google-genai 클라이언트 기반 gemini-omni-1.2-flash 호출 (AQ. 키 완벽 호환)
     if gemini_key:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={gemini_key}"
-            payload = {
-                "instances": [{"prompt": full_prompt}],
-                "parameters": {"sampleCount": 1, "aspectRatio": "1:1"}
-            }
-            r = requests.post(url, json=payload, timeout=25)
-            if r.status_code == 200:
-                preds = r.json().get("predictions", [])
-                if preds and preds[0].get("bytesBase64Encoded"):
-                    return base64.b64decode(preds[0]["bytesBase64Encoded"])
+            client = get_genai_client(gemini_key)
+            resp = client.models.generate_content(
+                model=VISUAL_OMNI_MODEL,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"]
+                )
+            )
+            if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+                for part in resp.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        data_val = part.inline_data.data
+                        return base64.b64decode(data_val) if isinstance(data_val, str) else data_val
         except Exception:
             pass
 
-        # Gemini 멀티모달 이미지 출력 모델 시도
-        for m_name in ["gemini-2.0-flash-exp-image-generation", "gemini-omni-1.2-flash"]:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={gemini_key}"
-                payload = {
-                    "contents": [{"parts": [{"text": full_prompt}]}],
-                    "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
-                }
-                r = requests.post(url, json=payload, timeout=25)
-                if r.status_code == 200:
-                    parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    for p in parts:
-                        if "inlineData" in p and p["inlineData"].get("data"):
-                            return base64.b64decode(p["inlineData"]["data"])
-            except Exception:
-                continue
-
-    # 2) OpenAI DALL-E 3 폴백 시도 (OpenAI 키가 입력된 경우)
+    # 2) OpenAI DALL-E 3 보조 호출
     if openai_key:
         try:
             headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
@@ -546,8 +613,8 @@ def generate_ai_illustration(visual_prompt, slide_title, theme_style, openai_key
         except Exception:
             pass
 
-    # 3) 100% 보장 프로시저럴 벡터 인포그래픽 생성
-    return generate_procedural_infographic(slide_title, visual_prompt, theme_style, custom_font_paths=custom_font_paths)
+    # 3) 슬라이드 카드 맞춤형 벡터 다이어그램 폴백
+    return generate_procedural_infographic(slide_obj, theme_style, custom_font_paths=custom_font_paths)
 
 # ==========================================
 # [8] 초자연스러운 성우 음성 엔진 (OpenAI ChatGPT TTS + Edge Neural TTS)
@@ -569,7 +636,6 @@ def create_natural_tts_audio(script_text, output_path, tts_config):
     edge_voice = tts_config.get("edge_voice", "ko-KR-InJoonNeural")
     speed_rate = float(tts_config.get("speed", 1.03))
 
-    # 1) OpenAI TTS 호출
     if "OpenAI" in engine and openai_key:
         headers = {
             "Authorization": f"Bearer {openai_key}",
@@ -601,7 +667,6 @@ def create_natural_tts_audio(script_text, output_path, tts_config):
             except Exception:
                 continue
 
-    # 2) Edge Neural TTS 호출 (무료 남성/여성 아나운서)
     if EDGE_TTS_AVAILABLE:
         try:
             pct = int((speed_rate - 1.0) * 100)
@@ -622,14 +687,33 @@ def create_natural_tts_audio(script_text, output_path, tts_config):
         except Exception:
             pass
 
-    # 3) 최후 비상 폴백
     tts = gTTS(text=clean_script, lang="ko", slow=False)
     tts.save(output_path)
     return output_path
 
 # ==========================================
-# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진
+# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진 (이미지 잘림 0% 보존)
 # ==========================================
+def paste_image_contain(base_img, img_bytes, box_coords, bg_color=(248, 250, 252)):
+    """
+    어떤 비율(16:9, 4:3, 1:1)의 그림이나 사진이 들어와도 상하좌우가 절대 잘리지 않도록
+    원본 비율을 100% 유지(contain)하여 박스 정중앙에 깔끔하게 배치합니다.
+    """
+    x1, y1, x2, y2 = box_coords
+    target_w = max(10, x2 - x1)
+    target_h = max(10, y2 - y1)
+    try:
+        src = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        contained = ImageOps.contain(src, (target_w, target_h), method=Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (target_w, target_h), bg_color)
+        offset_x = (target_w - contained.width) // 2
+        offset_y = (target_h - contained.height) // 2
+        canvas.paste(contained, (offset_x, offset_y))
+        base_img.paste(canvas, (x1, y1))
+        return True
+    except Exception:
+        return False
+
 def paste_circular_avatar(base_img, photo_bytes, center_x, center_y, radius, border_color, border_width=6):
     """부문장님 얼굴 사진을 원형으로 깔끔하게 크롭하여 배지 안에 합성합니다."""
     draw = ImageDraw.Draw(base_img)
@@ -675,14 +759,16 @@ def draw_background_grid_hd(draw, width, height, theme_mode):
 def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font_config, theme_mode, leader_photos=None):
     """
     모든 슬라이드를 Full HD (1920x1080) 고해상도 PNG로 렌더링합니다.
-    이 이미지가 미리보기, PPTX 슬라이드, MP4 영상에 동일하게 사용되어 깨짐이나 어긋남이 0%입니다.
+    미리보기, PPTX 슬라이드, MP4 영상에 100% 동일하게 사용됩니다.
     """
     width, height = 1920, 1080
 
     if slide_data.get("custom_image_bytes"):
         img = Image.open(io.BytesIO(slide_data["custom_image_bytes"])).convert("RGB")
-        img = img.resize((width, height), Image.Resampling.LANCZOS)
-        img.save(output_path, quality=95)
+        img = ImageOps.contain(img, (width, height), method=Image.Resampling.LANCZOS)
+        bg_canvas = Image.new("RGB", (width, height), (255, 255, 255))
+        bg_canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+        bg_canvas.save(output_path, quality=95)
         return output_path
 
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
@@ -708,7 +794,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
     leader_photos = leader_photos or {}
 
     # ---------------------------------------------------------
-    # [1] INTRO_1TOP_3BOT: 상단 생산본부장 와이드 + 하단 3개 부문장 3열 (얼굴 사진 원형 합성 지원)
+    # [1] INTRO_1TOP_3BOT: 상단 생산본부장 와이드 + 하단 3개 부문장 3열 (깃허브 얼굴 사진 원형 합성)
     # ---------------------------------------------------------
     if layout in ("INTRO_1TOP_3BOT", "INTRO_4GRID"):
         draw.rectangle([(0, 0), (width, height)], fill=(244, 246, 250))
@@ -718,7 +804,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         cards = slide_data.get("cards", [])
         top_card = cards[0] if len(cards) > 0 else {"header": "생산본부", "sub": "생산본부장", "body": ""}
 
-        # 상단 와이드 카드 (생산본부장)
         tx1, ty1, tx2, ty2 = 60, 118, 1860, 396
         red_col = (220, 38, 38)
         draw.rounded_rectangle([(tx1 + 4, ty1 + 5), (tx2 + 4, ty2 + 5)], radius=20, fill=(215, 222, 232))
@@ -731,7 +816,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         dept_top = top_card.get("header", "생산본부")
         role_top = top_card.get("sub", "생산본부장")
         if has_top_photo:
-            # 사진이 있을 때는 사진 우측에 직책 표기 (사진 가림 0%)
             draw.text((tx1 + 212, cy_top - 32), dept_top, font=f_badge_dept, fill=(100, 116, 139))
             draw.text((tx1 + 212, cy_top - 2), role_top, font=f_badge_role, fill=(15, 23, 42))
             divider_x = tx1 + 375
@@ -752,7 +836,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             draw.text((divider_x + 76, t_y), line, font=f_small, fill=(30, 41, 59))
             t_y += 38
 
-        # 하단 3열 세로 카드
         bottom_defaults = [
             ("유제품생산부문", "유제품생산부문장"),
             ("상온제품생산부문", "상온제품생산부문장"),
@@ -880,7 +963,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
     card_border_col = (30, 64, 175) if is_light else (16, 185, 129)
 
     # ---------------------------------------------------------
-    # [3] COVER: 고해상도 표지 (우측에 시각 도면 카드 함께 배치하여 심심함 해소)
+    # [3] COVER: 고해상도 표지 (우측에 잘림 없는 대표 도면 배치)
     # ---------------------------------------------------------
     if layout == "COVER":
         box_x1, box_y1, box_x2, box_y2 = 110, 150, 1810, 930
@@ -909,13 +992,9 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             sy += 52
 
         if has_cover_vis:
-            try:
-                c_img = Image.open(io.BytesIO(slide_data["visual_bytes"])).convert("RGB")
-                c_img = ImageOps.fit(c_img, (540, 540), method=Image.Resampling.LANCZOS)
-                img.paste(c_img, (box_x2 - 610, box_y1 + 90))
-                draw.rectangle([(box_x2 - 610, box_y1 + 90), (box_x2 - 70, box_y1 + 630)], outline=card_border_col, width=4)
-            except Exception:
-                pass
+            cx1, cy1, cx2, cy2 = box_x2 - 610, box_y1 + 90, box_x2 - 70, box_y1 + 630
+            paste_image_contain(img, slide_data["visual_bytes"], (cx1, cy1, cx2, cy2), bg_color=(238, 244, 252) if is_light else (13, 25, 43))
+            draw.rectangle([(cx1, cy1), (cx2, cy2)], outline=card_border_col, width=4)
 
         draw.line([(box_x1 + 85, box_y2 - 135), (box_x2 - 85, box_y2 - 135)], fill=card_border_col, width=3)
         footer_info = f"품질안전부문 식품안전팀 곽정혁  |  {datetime.date.today().strftime('%Y년 %m월')}"
@@ -968,7 +1047,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                     cy += 39
 
     # ---------------------------------------------------------
-    # [5] SPLIT_VISUAL: 좌측 고해상도 일러스트/도면/현장사진 + 우측 핵심 카드
+    # [5] SPLIT_VISUAL: 좌측 슬라이드 맞춤 AI 도면(잘림 없는 contain 배치) + 우측 핵심 카드
     # ---------------------------------------------------------
     elif layout == "SPLIT_VISUAL" or slide_data.get("visual_bytes"):
         vx1, vy1, vx2, vy2 = 65, 184, 915, 970
@@ -976,14 +1055,15 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
 
         v_bytes = slide_data.get("visual_bytes")
         if not v_bytes:
-            v_bytes = generate_procedural_infographic(slide_data.get("title", ""), slide_data.get("visual_prompt", ""), theme_mode, custom_font_paths=custom_paths)
+            v_bytes = generate_procedural_infographic(slide_data, theme_mode, custom_font_paths=custom_paths)
 
-        try:
-            v_img = Image.open(io.BytesIO(v_bytes)).convert("RGB")
-            v_img = ImageOps.fit(v_img, (vx2 - vx1 - 28, vy2 - vy1 - 28), method=Image.Resampling.LANCZOS)
-            img.paste(v_img, (vx1 + 14, vy1 + 14))
-        except Exception:
-            pass
+        inner_pad = 16
+        paste_image_contain(
+            img,
+            v_bytes,
+            (vx1 + inner_pad, vy1 + inner_pad, vx2 - inner_pad, vy2 - inner_pad),
+            bg_color=(238, 244, 252) if is_light else (13, 25, 43)
+        )
 
         cards = slide_data.get("cards", [])
         if not cards:
@@ -1089,7 +1169,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
     return output_path
 
 # ==========================================
-# [10] 고해상도 이미지 기반 파워포인트(.pptx) 생성기 (노트북 스타일 100% 일치)
+# [10] 고해상도 이미지 기반 파워포인트(.pptx) 생성기 (깨짐 0%)
 # ==========================================
 def generate_highres_image_pptx(slides_data, font_config, theme_mode, leader_photos=None):
     """
@@ -1158,11 +1238,11 @@ def media_worker(idx, slide_data, total_slides, temp_dir, font_config, theme_mod
     return idx, img_path, audio_path
 
 # ==========================================
-# [11] Gemini AI 기획 엔진 (시각 도면 강화 + 구어체/생동감 대본 설계)
+# [11] Gemini 3.8 Flash 기획 엔진 (google-genai SDK / AQ. 키 완벽 호환)
 # ==========================================
-def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text):
-    model = genai.GenerativeModel(model_name)
-    generation_config = genai.types.GenerationConfig(temperature=0.25, max_output_tokens=65536)
+def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text):
+    client = get_genai_client(GEMINI_API_KEY)
+    generation_config = types.GenerateContentConfig(temperature=0.25, max_output_tokens=65536)
 
     if intro_config["mode"] != "당부 말씀 슬라이드 생략":
         intro_instruction = f"""
@@ -1181,8 +1261,8 @@ def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, i
 
     system_prompt = f"""
     당신은 연세유업 아산공장 식품안전팀(담당자: 곽정혁)의 수석 위생교육 콘텐츠 디렉터이자 HACCP 전문가입니다.
-    학습자가 절대 졸거나 지루해하지 않도록 **시각적인 도면·일러스트가 풍부한 슬라이드 구조**와, **실제 인기 강사나 라디오 DJ처럼 귀에 쏙쏙 꽂히는 생동감 넘치는 구어체 내레이션 대본**을 설계해야 합니다.
-    단, 법적 기준·온도·수치·규정 등 모든 교육 내용은 추측 없이 100% 명확한 팩트와 업로드된 자료에만 기반하십시오.
+    참고 동영상이나 문서가 주어지면 그 안의 **핵심 교육 내용·법적 기준·수치·원칙만 정확히 추출**하여 재구성하십시오.
+    (동영상 화면을 그대로 캡처하지 않고, 각 슬라이드 내용에 100% 맞춘 새로운 AI 일러스트/도면을 `{VISUAL_OMNI_MODEL}`이 직접 그릴 것입니다.)
     (※ 마지막 이벤트 안내 슬라이드는 파이썬 코드가 자동 결합하므로 생성하지 마십시오.)
 
     [교육 월]: {edu_month_str}
@@ -1192,23 +1272,25 @@ def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, i
     {intro_instruction}
 
     [시각화 및 레이아웃("layout") 배정 핵심 규칙]:
-    1. "COVER": 표지 슬라이드에도 우측에 들어갈 멋진 대표 일러스트 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
+    1. "COVER": 표지 슬라이드에도 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
     2. "TOC_STEP": 3~5단계 전체 교육 목차 카드.
-    3. 본론 슬라이드({body_slide_count}장) 중 **최소 절반 이상(60% 이상)을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하여 매 페이지마다 풍부한 그림·도면·현장 시각자료가 함께 보이도록 하십시오!
-       - "SPLIT_VISUAL": 좌측에는 큼직한 시각 도면/일러스트/영상캡처가 들어가고 우측에는 2~3개의 핵심 요약 카드가 배치됩니다.
-         * "visual_prompt": 슬라이드 핵심 내용을 직관적으로 보여주는 3D 아이소메트릭 공정도, 위생 설비 단면도, 작업자 위생 수칙 일러스트 등을 묘사하는 구체적인 영문 프롬프트를 반드시 작성하십시오 (글자 없는 순수 그림 묘사).
-         * 만약 업로드된 참고 동영상(MP4)의 특정 장면을 캡처해 쓰는 것이 더 효과적이라면 해당 시간(초 단위 숫자)을 "video_timestamp_sec"에 적으십시오.
-       - "CARDS_3COL": 핵심 수치(예: "3mm 이상", "540 Lux", "15℃ 이하") 강조 비교가 필요할 때 사용 ("metric" 필드에 짧은 강조 수치 기입).
-       - "TABLE_MATRIX": 기준표, 행정처분, 4M1E, 구역 비교 등 표가 꼭 필요한 1~2장에 사용 ("table_headers", "table_rows" 필수 작성).
+    3. 본론 슬라이드({body_slide_count}장) 중 **최소 70% 이상을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하십시오!
+       - "SPLIT_VISUAL": 좌측에는 1:1 정사각형 AI 맞춤 도면이 들어가고, 우측에는 2~3개의 핵심 요약 카드("cards")가 배치됩니다.
+       - **[매우 중요] "visual_prompt" 작성 규칙:**
+         해당 슬라이드의 우측 카드("cards") 2~3개에 적힌 구체적인 설비·행동·위생 수칙이 **하나의 그림 안에 모두 시각적으로 표현되도록** 구체적인 영문 프롬프트를 작성하십시오!
+         * 예시: 우측 카드가 '1) 위생적 배치 및 오염 방지 설비(벽·바닥 이격, 아크릴 커버)'와 '2) 예방보전 및 유휴설비 관리(보호커버 랩핑)'라면,
+           -> `"visual_prompt": "Isometric 3D food factory diagram showing two clear scenes side by side: (Left) stainless steel processing equipment spaced away from walls and floor for easy cleaning with a transparent acrylic dust cover over the conveyor belt; (Right) an idle food machine neatly wrapped in protective clear plastic film with an inspection checklist, clean vector blueprint style, strictly no text or letters"`
+         * 그림 내부에 글자(Text/Letters)가 들어가지 않도록 `"strictly no text or letters"`를 항상 명시하십시오.
+       - "CARDS_3COL": 핵심 수치(예: "3mm 이상", "540 Lux", "15℃ 이하") 3열 비교가 꼭 필요한 1장에만 사용 ("metric" 필드에 짧은 강조 수치 기입).
+       - "TABLE_MATRIX": 기준표, 행정처분, 구역 비교 등 표가 꼭 필요한 1장에 사용 ("table_headers", "table_rows" 필수 작성).
        - "SELF_AUDIT_2X2": 본론 가장 마지막 장은 현장 작업자용 '핵심 자가 진단 체크리스트' 4분할 카드로 구성하십시오 (각 줄 앞에 '☑ ' 또는 '□ ' 표기).
 
-    [성우 내레이션 대본("script") 작성 절대 원칙 - 매우 중요!]:
+    [성우 내레이션 대본("script") 작성 절대 원칙]:
     - 문어체("~함", "~임", "~바랍니다"의 기계적 반복)를 피하고, **실제 사람이 눈을 맞추며 대화하듯 자연스럽고 생동감 넘치는 구어체("~거든요", "~해보면 어떨까요?", "자, 여기서 정말 중요한 포인트가 하나 있습니다!", "~해주시는 센스, 잊지 마세요!")**를 적절히 섞어 유쾌하고 몰입감 있게 작성하십시오.
     - 오디오 성우가 자연스럽게 숨을 쉬며 읽을 수 있도록 쉼표(,)와 마침표(.)를 호흡 단위로 꼼꼼히 찍어주십시오.
-    - 영문 약어(HACCP, CCP 등)는 성우가 자연스럽게 발음하도록 문맥을 매끄럽게 이어주십시오.
 
     [출력 형식 규칙]:
-    먼저 <pre_calc> 태그 안에 슬라이드별 시각 도면 구상과 팩트 검증 요약을 적고, 이어서 <json_output> 태그 안에 순수 JSON 배열만 출력하십시오. (코드 축약 및 '...' 생략 절대 금지)
+    먼저 <pre_calc> 태그 안에 슬라이드별 카드 구성과 맞춤형 도면 구상을 요약하고, 이어서 <json_output> 태그 안에 순수 JSON 배열만 출력하십시오. (코드 축약 및 '...' 생략 절대 금지)
 
     <pre_calc>
     사전 설계 요약
@@ -1218,19 +1300,18 @@ def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, i
       {{
         "layout": "SPLIT_VISUAL",
         "type": "BODY",
-        "title": "슬라이드 제목",
+        "title": "설비 배치 및 예방보전 유지관리",
         "subtitle": "",
         "content": "",
         "cards": [
-          {{"header": "카드 소제목 1", "sub": "", "metric": "540 Lux", "body": "• 핵심 설명 첫째 줄\\n• 핵심 설명 둘째 줄"}},
-          {{"header": "카드 소제목 2", "sub": "", "metric": "", "body": "• 핵심 설명 첫째 줄\\n• 핵심 설명 둘째 줄"}}
+          {{"header": "위생적 배치 및 오염 방지 설비", "sub": "", "metric": "벽·바닥 이격", "body": "• 세척·소독이 용이하도록 설비와 벽면, 바닥 사이에 충분한 작업 공간 및 이격 거리 확보\\n• 개방형 이송 라인 상부에는 이물 낙하 방지용 투명 아크릴 커버 설치"}},
+          {{"header": "예방보전 및 유휴설비 관리", "sub": "", "metric": "보호커버 랩핑", "body": "• 정기 점검표 기반 마모 부품, 가스켓, 볼트·너트 조임 상태 주기적 점검\\n• 장기 미사용 유휴설비는 세척·소독 후 보호 랩핑 처리 및 식별표 부착"}}
         ],
         "table_headers": [],
         "table_rows": [],
-        "bottom_summary": "현장 작업자가 기억해야 할 한 줄 핵심 원칙",
-        "visual_prompt": "Isometric 3D illustration of a clean dairy factory inspection room with bright LED protective lighting over stainless steel conveyor belt, clean vector style, no text",
-        "video_timestamp_sec": null,
-        "script": "자, 다음으로 우리 현장의 조명 기준을 한번 살펴볼까요? 선별이나 검사가 이루어지는 구역은 최소 540 룩스 이상의 밝기가 확보되어야 하는데요, 왜 이렇게 밝아야 할까요? 바로 미세한 이물질 하나까지도 우리 눈으로 놓치지 않고 잡아내기 위해서입니다..."
+        "bottom_summary": "설비는 세척하기 편하게 띄워 배치하고, 쉬고 있는 설비는 랩핑 후 이름표를 붙여줍니다.",
+        "visual_prompt": "Isometric 3D technical illustration of a hygienic dairy factory floor: stainless steel machine positioned with clear gap from walls and floor, transparent acrylic shield over conveyor line, and a clean plastic-wrapped idle machine next to a maintenance checklist board, centered full view, strictly no text or letters",
+        "script": "자, 다음으로 우리 현장의 설비 배치와 유지관리 수칙을 함께 살펴볼까요? 설비를 배치할 때는 세척과 소독이 쉽도록 벽면이나 바닥에서 충분한 간격을 띄워주어야 하는데요..."
       }}
     ]
     </json_output>
@@ -1245,7 +1326,11 @@ def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, i
 
     for attempt in range(3):
         try:
-            response = model.generate_content(payload, generation_config=generation_config)
+            response = client.models.generate_content(
+                model=PLANNING_MODEL,
+                contents=payload,
+                config=generation_config
+            )
             raw_text = response.text
             pre_match = re.search(r'<pre_calc>(.*?)</pre_calc>', raw_text, re.DOTALL)
             pre_log = pre_match.group(1).strip() if pre_match else ""
@@ -1262,10 +1347,10 @@ def generate_ai_storyboard(model_name, topic, edu_month_str, body_slide_count, i
             if attempt < 2:
                 time.sleep(4)
                 continue
-            return None, None, f"AI 기획안 생성 오류: {e}"
+            return None, None, f"AI 기획안 생성 오류 ({PLANNING_MODEL}): {e}"
 
-def generate_scripts_for_existing_pdf(model_name, pdf_pages_info, edu_month_str, topic):
-    model = genai.GenerativeModel(model_name)
+def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic):
+    client = get_genai_client(GEMINI_API_KEY)
     slides_text_dump = "\n\n".join([f"[슬라이드 {p['page_num']} 텍스트]:\n{p['text']}" for p in pdf_pages_info])
     prompt = f"""
     다음은 연세유업 아산공장 '{edu_month_str} 정기 위생교육 ({topic})' 슬라이드 총 {len(pdf_pages_info)}장의 텍스트입니다.
@@ -1281,7 +1366,7 @@ def generate_scripts_for_existing_pdf(model_name, pdf_pages_info, edu_month_str,
     [추출된 슬라이드 텍스트 전체]:
     {slides_text_dump}
     """
-    resp = model.generate_content(prompt)
+    resp = client.models.generate_content(model=PLANNING_MODEL, contents=prompt)
     clean_j = re.sub(r'^```json\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE).strip()
     return json.loads(clean_j)
 
@@ -1291,7 +1376,7 @@ def generate_scripts_for_existing_pdf(model_name, pdf_pages_info, edu_month_str,
 def main():
     st.markdown(custom_theme_css, unsafe_allow_html=True)
 
-    for key in ["slides_data", "pre_calc_log", "final_video_bytes", "final_pptx_bytes", "custom_font_paths", "uploaded_video_local_path", "leader_photos", "intro_full_slide_bytes"]:
+    for key in ["slides_data", "pre_calc_log", "final_video_bytes", "final_pptx_bytes", "custom_font_paths", "leader_photos", "intro_full_slide_bytes"]:
         if key not in st.session_state:
             if key == "custom_font_paths":
                 st.session_state[key] = {}
@@ -1300,12 +1385,17 @@ def main():
             else:
                 st.session_state[key] = None
 
-    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(Full-HD 이미지 PPTX · AI 도면 일러스트 · 초자연 성우 통합판)</span></h1>", unsafe_allow_html=True)
-    st.markdown("원본 교육 영상(MP4)·문서 업로드부터 **부문장님 사진 포함 당부말씀 ➡️ 시각 도면 본론 슬라이드 ➡️ 월별 고정 이벤트 ➡️ 깨짐 없는 이미지 PPTX & 자연스러운 성우 MP4**까지 원스톱으로 완성합니다.")
+    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(Vertex AQ. 호환 · 3.8 Flash 기획 · Omni 맞춤 도면)</span></h1>", unsafe_allow_html=True)
+    st.markdown("원본 교육 영상(MP4)·문서에서 핵심 팩트만 추출하여 **슬라이드별 카드 내용에 딱 맞는 AI 자체 도면 일러스트(잘림 0%)**와 **초자연스러운 구어체 성우 더빙**으로 완성합니다.")
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # --- 좌측 사이드바 ---
     with st.sidebar:
+        st.header("🧠 고정 AI 엔진 상태")
+        key_type_label = "Vertex AI (AQ. 키)" if GEMINI_API_KEY.startswith("AQ.") else "표준 Gemini API"
+        st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·대본:** `{PLANNING_MODEL}`\n• **맞춤 도면·영상:** `{VISUAL_OMNI_MODEL}`")
+
+        st.markdown("---")
         st.header("🎙️ 성우 목소리 엔진 설정")
         tts_engine = st.radio(
             "음성 합성 엔진 선택",
@@ -1313,14 +1403,14 @@ def main():
             index=0 if DEFAULT_OPENAI_KEY else 1
         )
         openai_key_input = st.text_input(
-            "OpenAI API Key (OpenAI TTS / DALL-E 도면용)",
+            "OpenAI API Key (번외: ChatGPT 음성/DALL-E용)",
             value=DEFAULT_OPENAI_KEY,
             type="password",
-            help="Streamlit Secrets에 OPENAI_API_KEY를 등록해 두면 매번 입력하지 않아도 자동 연결됩니다."
-        )
+            help="OpenAI TTS를 쓰실 때만 입력하시면 됩니다. 미입력 시 무료 신경망 남성 아나운서(Edge TTS)로 자동 전환됩니다."
+        ).strip().strip('"').strip("'")
 
         if "OpenAI" in tts_engine:
-            openai_model = st.selectbox("OpenAI 음성 모델", ["gpt-4o-mini-tts", "tts-1-hd"], index=0, help="gpt-4o-mini-tts는 강사/팟캐스트 억양 지시가 반영되어 가장 사람처럼 자연스럽습니다.")
+            openai_model = st.selectbox("OpenAI 음성 모델", ["gpt-4o-mini-tts", "tts-1-hd"], index=0)
             voice_labels = {
                 "echo (친근하고 부드러운 남성 - 추천)": "echo",
                 "onyx (신뢰감 있는 중저음 남성)": "onyx",
@@ -1362,18 +1452,12 @@ def main():
                 st.audio(af.read(), format="audio/mp3")
 
         st.markdown("---")
-        st.header("🎨 AI 두뇌 & 시각 테마 설정")
-        selected_model = st.selectbox(
-            "Gemini 기획 모델",
-            ["gemini-3.8-flash", "gemini-omni-1.2-flash", "gemini-2.5-flash", "gemini-4-argon"],
-            index=0
-        )
+        st.header("🎨 슬라이드 테마 설정")
         theme_mode = st.radio(
             "슬라이드 디자인 테마",
             ["10월 스타일 (라이트 블루프린트 모눈 테마)", "9월 스타일 (다크 사이버네틱 네온 테마)"],
             index=0
         )
-        enable_ai_drawing = st.checkbox("슬라이드에 AI 시각 도면/일러스트 자동 생성", value=True)
 
         st.markdown("---")
         st.header("🔤 깃허브 font/ 폴더 서체 연동")
@@ -1404,7 +1488,7 @@ def main():
 
     tab1, tab2, tab3 = st.tabs([
         "1. 교육 영상/자료 입력 & 당부말씀·이벤트 설정",
-        "2. 고해상도 슬라이드 미리보기 & 그림·대본 편집",
+        "2. 고해상도 슬라이드 미리보기 & AI 맞춤 도면·대본 편집",
         "3. 고해상도 이미지 PPTX & 성우 MP4 렌더링"
     ])
 
@@ -1423,7 +1507,7 @@ def main():
         workflow_mode = st.radio(
             "본론 슬라이드 생성 방식:",
             [
-                "표준 모드: 참고 교육 영상(MP4)·문서(PPTX/PDF) 또는 주제 입력 ➡️ AI가 시각 도면 포함 고해상도 슬라이드 & 구어체 대본 새로 제작",
+                "표준 모드: 참고 교육 영상(MP4)·문서(PPTX/PDF) 내용 분석 ➡️ 슬라이드 카드 내용에 맞춘 AI 자체 도면(Omni) & 구어체 대본(3.8 Flash) 제작",
                 "PDF 직행 모드: 이미 완성된 슬라이드 PDF 업로드 ➡️ 원본 디자인 그대로 유지하고 앞뒤에 당부말씀·이벤트 결합 및 성우 더빙"
             ],
             index=0
@@ -1438,7 +1522,7 @@ def main():
             col_s1, col_s2 = st.columns([1.2, 1])
             with col_s1:
                 uploaded_sources = st.file_uploader(
-                    "참고할 원본 교육 영상(MP4) 또는 문서(PDF, PPTX) 업로드 (복수 선택 가능):",
+                    "참고할 원본 교육 영상(MP4) 또는 문서(PDF, PPTX) 업로드 (복수 선택 가능 / 영상 캡처 없이 내용만 추출):",
                     type=["mp4", "pdf", "pptx"],
                     accept_multiple_files=True
                 )
@@ -1454,8 +1538,8 @@ def main():
 
         st.markdown("---")
 
-        # --- Step 2: 당부 말씀 (얼굴 사진 깃허브 고정 & 슬라이드 이미지 직행 모두 지원) ---
-        st.markdown("### 👔 Step 2. 오프닝: 월간 위생교육 전 당부말씀 (상단 생산본부장 + 하단 3부문장 & 얼굴 사진 연동)")
+        # --- Step 2: 당부 말씀 (얼굴 사진 깃허브 고정) ---
+        st.markdown("### 👔 Step 2. 오프닝: 월간 위생교육 전 당부말씀 (상단 생산본부장 + 하단 3부문장 & 깃허브 고정 사진 연동)")
         intro_mode = st.radio(
             "당부 말씀 적용 방식:",
             [
@@ -1470,7 +1554,6 @@ def main():
 
         if "PPTX 업로드" in intro_mode:
             st.session_state["intro_full_slide_bytes"] = None
-            # 깃허브 고정 사진이 비어있다면 다시 한 번 스캔하여 항상 고정 유지
             if not st.session_state.get("leader_photos"):
                 st.session_state["leader_photos"] = load_default_leader_photos_from_repo()
 
@@ -1494,7 +1577,7 @@ def main():
             with col_b3:
                 ldr_qc = st.text_area("🔵 [하단 우측] 품질안전부문 (품질안전부문장)", value=default_qc, height=135)
 
-            with st.expander("📸 부문장님 프로필 사진 개별 확인 / 교체 (선택)"):
+            with st.expander("📸 부문장님 프로필 사진 개별 확인 / 수동 교체 (선택)"):
                 p_cols = st.columns(4)
                 for idx_p, (dept_k, label_k) in enumerate([
                     ("생산본부", "생산본부장 사진"),
@@ -1553,37 +1636,38 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        if st.button("🚀 고해상도 시각 슬라이드 & 구어체 성우 대본 일괄 기획 시작", type="primary", use_container_width=True):
+        if st.button("🚀 3.8 Flash 기획 & Omni 슬라이드별 맞춤 도면 일괄 생성 시작", type="primary", use_container_width=True):
             if not GEMINI_API_KEY:
-                st.error("Streamlit Secrets에 GEMINI_API_KEY를 설정해주세요.")
+                st.error("Streamlit Secrets에 GOOGLE_API_KEY 또는 GEMINI_API_KEY를 설정해주세요.")
             elif "표준 모드" in workflow_mode:
-                with st.spinner("원본 자료 분석, 구어체 성우 대본 작성 및 각 슬라이드별 시각 도면/일러스트를 생성하고 있습니다..."):
+                with st.spinner(f"[{PLANNING_MODEL}] 교육 내용 정밀 분석 및 [{VISUAL_OMNI_MODEL}] 슬라이드별 맞춤형 도면 생성 중..."):
                     gemini_files = []
                     combined_text = extra_source_text
-                    extracted_ref_images = []
-                    st.session_state["uploaded_video_local_path"] = None
 
                     for f in uploaded_sources:
                         ext = os.path.splitext(f.name)[1].lower()
                         if ext == ".pptx":
-                            p_txt, p_imgs = extract_text_and_Media_from_pptx(f)
+                            p_txt, _ = extract_text_and_Media_from_pptx(f)
                             combined_text += f"\n\n[참고 PPTX ({f.name}) 내용]:\n{p_txt}"
-                            extracted_ref_images.extend([x["bytes"] for x in p_imgs])
-                        else:
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        elif ext == ".pdf" and PYMUPDF_AVAILABLE:
+                            pdf_pages = extract_pages_from_pdf(f.getvalue())
+                            pdf_txt = "\n\n".join([f"[페이지 {p['page_num']}]\n{p['text']}" for p in pdf_pages if p.get("text")])
+                            combined_text += f"\n\n[참고 PDF ({f.name}) 내용]:\n{pdf_txt}"
+                        elif ext == ".mp4":
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
                                 tmp.write(f.getbuffer())
                                 tmp_path = tmp.name
-                            if ext == ".mp4":
-                                st.session_state["uploaded_video_local_path"] = tmp_path
-                            up_f = genai.upload_file(tmp_path)
-                            while up_f.state.name == "PROCESSING":
-                                time.sleep(2)
-                                up_f = genai.get_file(up_f.name)
-                            gemini_files.append(up_f)
+                            try:
+                                gemini_files.append(build_inline_video_part(tmp_path))
+                            finally:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                        else:
+                            gemini_files.append(types.Part.from_bytes(data=f.getvalue(), mime_type="application/pdf"))
 
                     intro_cfg = {"mode": intro_mode, "custom_text": intro_custom_text}
                     slides, pre_log, err = generate_ai_storyboard(
-                        selected_model, topic, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text
+                        topic, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text
                     )
                     if err:
                         st.error(err)
@@ -1603,28 +1687,20 @@ def main():
                                     {"header": "품질안전부문", "sub": "품질안전부문장", "body": ldr_qc}
                                 ]
 
-                        # [수정 핵심] 서브 스레드 진입 전, 메인 스레드에서 st.session_state 값을 일반 변수로 미리 추출!
-                        local_video_path = st.session_state.get("uploaded_video_local_path")
+                        # 서브 스레드 진입 전 메인 스레드에서 폰트 경로 복사 (KeyError 원천 방지)
                         local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
 
-                        # 병렬로 슬라이드 시각 일러스트/영상 프레임 채우기 (내부에서 st.session_state 호출 절대 금지)
+                        # 영상 캡처 없이 무조건 슬라이드 카드 내용에 맞춘 AI 자체 도면(Omni) 생성
                         def _fill_visual(idx_s, s_obj):
                             if s_obj.get("layout") in ("SPLIT_VISUAL", "COVER") and not s_obj.get("visual_bytes"):
-                                ts = s_obj.get("video_timestamp_sec")
-                                if ts is not None and local_video_path:
-                                    fb = capture_frame_from_video(local_video_path, ts)
-                                    if fb:
-                                        s_obj["visual_bytes"] = fb
-                                        return idx_s, s_obj
-                                if enable_ai_drawing:
-                                    s_obj["visual_bytes"] = generate_ai_illustration(
-                                        s_obj.get("visual_prompt", ""),
-                                        s_obj.get("title", topic),
-                                        theme_mode,
-                                        openai_key=openai_key_input,
-                                        gemini_key=GEMINI_API_KEY,
-                                        custom_font_paths=local_custom_fonts
-                                    )
+                                s_obj["visual_bytes"] = generate_ai_illustration(
+                                    s_obj,
+                                    topic,
+                                    theme_mode,
+                                    openai_key=openai_key_input,
+                                    gemini_key=GEMINI_API_KEY,
+                                    custom_font_paths=local_custom_fonts
+                                )
                             return idx_s, s_obj
 
                         with ThreadPoolExecutor(max_workers=4) as vis_exec:
@@ -1640,7 +1716,7 @@ def main():
                         st.session_state["pre_calc_log"] = pre_log
                         st.session_state["final_video_bytes"] = None
                         st.session_state["final_pptx_bytes"] = None
-                        st.success(f"총 {len(slides)}장의 고해상도 시각 슬라이드 및 구어체 대본 생성이 완료되었습니다! [2번 탭]에서 확인하세요.")
+                        st.success(f"총 {len(slides)}장의 맞춤형 AI 도면 슬라이드 및 구어체 대본 생성이 완료되었습니다! [2번 탭]에서 확인하세요.")
             else:
                 if not existing_pdf_file:
                     st.warning("PDF 파일을 먼저 업로드해주세요.")
@@ -1649,7 +1725,7 @@ def main():
                 else:
                     with st.spinner("PDF 전 페이지 고해상도 추출 및 구어체 더빙 대본 생성 중..."):
                         pages_info = extract_pages_from_pdf(existing_pdf_file.getvalue())
-                        scripts_list = generate_scripts_for_existing_pdf(selected_model, pages_info, edu_month_str, topic)
+                        scripts_list = generate_scripts_for_existing_pdf(pages_info, edu_month_str, topic)
                         built_slides = []
 
                         if intro_mode != "당부 말씀 슬라이드 생략":
@@ -1690,14 +1766,14 @@ def main():
                         st.success(f"총 {len(built_slides)}장의 슬라이드 및 구어체 대본 준비 완료! [2번 탭]으로 이동하세요.")
 
     # ==========================================
-    # 탭 2: Full-HD 슬라이드 미리보기 & 시각 그림/대본 수정
+    # 탭 2: Full-HD 슬라이드 미리보기 & AI 맞춤 도면/대본 편집
     # ==========================================
     with tab2:
         if not st.session_state.get("slides_data"):
             st.info("먼저 [1번 탭]에서 슬라이드 기획을 실행해 주십시오.")
         else:
-            st.markdown("### 🖥️ Full-HD(1920×1080) 슬라이드 미리보기 및 현장 사진·대본 편집")
-            st.caption("이 화면에 보이는 고해상도 이미지 그대로 파워포인트(.pptx) 슬라이드와 MP4 교육 영상에 100% 똑같이 들어갑니다.")
+            st.markdown("### 🖥️ Full-HD(1920×1080) 슬라이드 미리보기 및 AI 맞춤 도면·대본 편집")
+            st.caption("모든 그림은 잘림 없는 원본 비율 유지(Contain) 방식으로 배치되며, 미리보기 화면 그대로 PPTX와 MP4 영상에 100% 동일하게 반영됩니다.")
 
             total_s = len(st.session_state["slides_data"])
             updated_slides = []
@@ -1709,21 +1785,41 @@ def main():
                         col_p1, col_p2 = st.columns([1.2, 1])
                         with col_p2:
                             new_title = st.text_input("슬라이드 제목", value=slide.get("title", ""), key=f"t_{idx}")
-                            new_script = st.text_area("성우 내레이션 대본 (구어체)", value=slide.get("script", ""), height=130, key=f"s_{idx}")
+                            new_script = st.text_area("성우 내레이션 대본 (구어체)", value=slide.get("script", ""), height=125, key=f"s_{idx}")
+                            slide["title"] = new_title
+                            slide["script"] = new_script
+
+                            if slide.get("layout") in ("SPLIT_VISUAL", "COVER", "CARDS_3COL"):
+                                new_v_prompt = st.text_input(
+                                    "AI 도면 생성 지시문 (우측 카드 내용과 자동 결합됨)",
+                                    value=slide.get("visual_prompt", ""),
+                                    key=f"vp_{idx}"
+                                )
+                                slide["visual_prompt"] = new_v_prompt
+
+                                if st.button(f"🎨 이 슬라이드 내용에 맞춰 AI 도면({VISUAL_OMNI_MODEL}) 다시 그리기", key=f"regen_v_{idx}", use_container_width=True):
+                                    with st.spinner(f"슬라이드 {idx + 1}의 카드 내용을 바탕으로 AI 맞춤 도면을 새로 그리고 있습니다..."):
+                                        slide["layout"] = "SPLIT_VISUAL" if slide.get("layout") != "COVER" else "COVER"
+                                        slide["visual_bytes"] = generate_ai_illustration(
+                                            slide,
+                                            topic,
+                                            theme_mode,
+                                            openai_key=openai_key_input,
+                                            gemini_key=GEMINI_API_KEY,
+                                            custom_font_paths=st.session_state["custom_font_paths"]
+                                        )
 
                             c_u1, c_u2 = st.columns(2)
                             with c_u1:
-                                part_vis = st.file_uploader("좌측 시각 그림/현장사진만 교체", type=["png", "jpg", "jpeg"], key=f"pv_{idx}")
+                                part_vis = st.file_uploader("좌측 그림만 현장사진으로 교체", type=["png", "jpg", "jpeg"], key=f"pv_{idx}")
                                 if part_vis:
                                     slide["visual_bytes"] = part_vis.getvalue()
-                                    slide["layout"] = "SPLIT_VISUAL"
+                                    if slide.get("layout") != "COVER":
+                                        slide["layout"] = "SPLIT_VISUAL"
                             with c_u2:
                                 full_rep = st.file_uploader("슬라이드 전체 이미지 통째 교체", type=["png", "jpg", "jpeg"], key=f"fr_{idx}")
                                 if full_rep:
                                     slide["custom_image_bytes"] = full_rep.getvalue()
-
-                        slide["title"] = new_title
-                        slide["script"] = new_script
 
                         with col_p1:
                             preview_img_path = os.path.join(preview_dir, f"preview_{idx}.png")
