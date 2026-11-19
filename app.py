@@ -50,6 +50,7 @@ socket.setdefaulttimeout(600)
 # 고정 AI 모델 상수 (유료 Gemini Developer API 직결)
 PLANNING_MODEL = "gemini-3.8-flash"
 VISUAL_OMNI_MODEL = "gemini-3.1-flash-image"
+MANDATORY_OPENING_LINE = "안녕하십니까, 식품안전팀 곽정혁입니다."
 
 # ==========================================
 # [2] 보안 접속 설정 (비밀번호: 2082)
@@ -169,7 +170,7 @@ custom_theme_css = """
 """
 
 # ==========================================
-# [5] 깃허브 font/ 폴더 자동 스캔 및 한글 폰트 로더 (특수기호 깨짐 방어 포함)
+# [5] 깃허브 font/ 폴더 자동 스캔, 특수기호 방어 및 Auto-Fit 텍스트 엔진
 # ==========================================
 FONT_SEARCH_DIRS = ["font", "fonts", "폰트", "."]
 
@@ -297,11 +298,111 @@ def wrap_text_by_pixel(text, font, max_width, draw):
                     if (bbox_c[2] - bbox_c[0]) <= max_width:
                         current_line = test_ch
                     else:
-                        lines.append(current_line)
+                        if current_line:
+                            lines.append(current_line)
                         current_line = ch
         if current_line:
             lines.append(current_line)
     return lines
+
+def _measure_wrapped_block(lines, font, sz, line_spacing_ratio, draw):
+    if not lines:
+        return 0, 0, []
+    step_gap = max(3, int(round(sz * line_spacing_ratio)))
+    empty_h = max(6, int(round(sz * 0.45)))
+    line_metrics = []
+    total_h = 0
+    max_w = 0
+    for idx, ln in enumerate(lines):
+        if not ln:
+            lh = empty_h
+            lw = 0
+        else:
+            bb = draw.textbbox((0, 0), ln, font=font)
+            lw = bb[2] - bb[0]
+            raw_h = bb[3] - bb[1]
+            lh = max(sz + 2, raw_h + 2)
+        max_w = max(max_w, lw)
+        gap = step_gap if (idx < len(lines) - 1 and ln) else 0
+        line_metrics.append((ln, lw, lh, gap))
+        total_h += lh + gap
+    return max_w, total_h, line_metrics
+
+def draw_autofit_textbox(
+    draw,
+    text,
+    box_coords,
+    font_choice,
+    max_font_size,
+    min_font_size=11,
+    fill=(30, 41, 59),
+    is_bold=False,
+    custom_font_paths=None,
+    align="left",
+    valign="top",
+    line_spacing_ratio=0.32
+):
+    """
+    주어진 사각형 영역(box_coords) 안에 모든 문장이 단 한 글자도 잘리지 않고 들어가도록
+    폰트 크기와 줄 간격을 자동으로 축소(Auto-Fit)하여 렌더링합니다.
+    """
+    if text is None:
+        return y_end if (y_end := box_coords[1]) else 0
+    raw_str = str(text).strip()
+    x1, y1, x2, y2 = box_coords
+    if not raw_str:
+        return y1
+
+    avail_w = max(24, x2 - x1)
+    avail_h = max(18, y2 - y1)
+
+    chosen_font = None
+    chosen_metrics = []
+    chosen_total_h = 0
+
+    for sz in range(int(max_font_size), int(min_font_size) - 1, -1):
+        ratio = line_spacing_ratio if sz > min_font_size + 2 else max(0.16, line_spacing_ratio * 0.65)
+        f_cand = load_pil_font(font_choice, sz, is_bold=is_bold, custom_font_paths=custom_font_paths)
+        lines = wrap_text_by_pixel(raw_str, f_cand, avail_w, draw)
+        mw, th, metrics = _measure_wrapped_block(lines, f_cand, sz, ratio, draw)
+        if mw <= avail_w + 2 and th <= avail_h:
+            chosen_font = f_cand
+            chosen_metrics = metrics
+            chosen_total_h = th
+            break
+
+    # 최소 크기에서도 세로가 넘칠 경우 초고밀도 간격으로 한 번 더 축소하여 문장 절단 원천 방지
+    if chosen_font is None:
+        for sz in range(int(min_font_size), 8, -1):
+            f_cand = load_pil_font(font_choice, sz, is_bold=is_bold, custom_font_paths=custom_font_paths)
+            lines = wrap_text_by_pixel(raw_str, f_cand, avail_w, draw)
+            mw, th, metrics = _measure_wrapped_block(lines, f_cand, sz, 0.12, draw)
+            chosen_font = f_cand
+            chosen_metrics = metrics
+            chosen_total_h = th
+            if th <= avail_h:
+                break
+
+    if valign == "center":
+        cur_y = y1 + max(0, (avail_h - chosen_total_h) // 2)
+    elif valign == "bottom":
+        cur_y = y1 + max(0, avail_h - chosen_total_h)
+    else:
+        cur_y = y1
+
+    for ln, lw, lh, gap in chosen_metrics:
+        if ln:
+            if align == "center":
+                cur_x = x1 + max(0, (avail_w - lw) // 2)
+            elif align == "right":
+                cur_x = x1 + max(0, avail_w - lw)
+            else:
+                cur_x = x1
+            bb = draw.textbbox((0, 0), ln, font=chosen_font)
+            draw.text((cur_x, cur_y - bb[1]), ln, font=chosen_font, fill=fill)
+        cur_y += lh + gap
+
+    return cur_y
 
 # ==========================================
 # [6] 문서/동영상 인라인 변환 및 리더 프로필 사진 유틸리티
@@ -498,17 +599,25 @@ def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=Non
         draw.line([(0, gy), (w, gy)], fill=(216, 228, 242) if is_light else (22, 40, 68), width=1)
 
     f_head = load_pil_font("연세제목체", 27, is_bold=True, custom_font_paths=custom_font_paths)
-    f_node = load_pil_font("연세제목체", 24, is_bold=True, custom_font_paths=custom_font_paths)
     f_desc = load_pil_font("연세본문체", 20, is_bold=False, custom_font_paths=custom_font_paths)
 
     s_title = str(slide_obj.get("title", "핵심 위생 관리 도해")).strip()
     cards = slide_obj.get("cards", [])
 
     draw.rounded_rectangle([(45, 36), (w - 45, 112)], radius=14, fill=sub_accent)
-    t_lines = wrap_text_by_pixel(f"핵심 공정·위생 도해 | {s_title}", f_head, w - 130, draw)
-    if t_lines:
-        bb = draw.textbbox((0, 0), t_lines[0], font=f_head)
-        draw.text(((w - (bb[2] - bb[0])) // 2, 58), t_lines[0], font=f_head, fill=(255, 255, 255))
+    draw_autofit_textbox(
+        draw,
+        f"핵심 공정·위생 도해 | {s_title}",
+        (65, 44, w - 65, 104),
+        "연세제목체",
+        max_font_size=27,
+        min_font_size=15,
+        fill=(255, 255, 255),
+        is_bold=True,
+        custom_font_paths=custom_font_paths,
+        align="center",
+        valign="center"
+    )
 
     node_items = cards[:3] if cards else [{"header": s_title, "body": slide_obj.get("content", ""), "metric": "HACCP"}]
     n_cnt = len(node_items)
@@ -533,14 +642,32 @@ def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=Non
         h_str = str(item.get("header", f"핵심 요소 {idx_n + 1}")).strip()
         m_str = str(item.get("metric", "")).strip()
         title_line = f"{h_str}  [{m_str}]" if m_str else h_str
-        draw.text((nx1 + 138, ny1 + 24), title_line[:28], font=f_node, fill=sub_accent if is_light else (52, 211, 153))
+        draw_autofit_textbox(
+            draw,
+            title_line,
+            (nx1 + 138, ny1 + 16, nx2 - 22, ny1 + 56),
+            "연세제목체",
+            max_font_size=24,
+            min_font_size=14,
+            fill=sub_accent if is_light else (52, 211, 153),
+            is_bold=True,
+            custom_font_paths=custom_font_paths,
+            valign="center"
+        )
 
         raw_b = str(item.get("body", "")).replace("•", "-").strip()
-        b_lines = wrap_text_by_pixel(raw_b, f_desc, (nx2 - nx1) - 165, draw)
-        by_cur = ny1 + 68
-        for bl in b_lines[:2]:
-            draw.text((nx1 + 138, by_cur), f"- {bl}", font=f_desc, fill=ink)
-            by_cur += 34
+        draw_autofit_textbox(
+            draw,
+            raw_b,
+            (nx1 + 138, ny1 + 62, nx2 - 22, ny2 - 14),
+            "연세본문체",
+            max_font_size=20,
+            min_font_size=12,
+            fill=ink,
+            is_bold=False,
+            custom_font_paths=custom_font_paths,
+            valign="center"
+        )
 
         if idx_n < n_cnt - 1:
             mid_x = w // 2
@@ -619,7 +746,7 @@ def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key=
     return generate_procedural_infographic(slide_obj, theme_style, custom_font_paths=custom_font_paths)
 
 # ==========================================
-# [8] 초자연 성우 엔진 (유료 Gemini Native TTS / NotebookLM 2인 대화 + OpenAI + Edge)
+# [8] 초자연 성우 엔진 (남성 진행자 고정 + 유료 Gemini Native TTS + OpenAI + Edge)
 # ==========================================
 def _split_script_chunks(text, max_chars=2600):
     lines = re.split(r'\n+|(?<=[.!?。])\s+', text.strip())
@@ -669,7 +796,7 @@ def _pcm_or_wav_to_mp3(raw_audio_bytes, mime_type, output_path, speed_rate=1.0):
                 pass
 
 def _auto_convert_to_two_speaker(script_text):
-    """단독 대본일지라도 2인 대화 모드가 켜져 있으면 자연스럽게 진행자/파트너 교대 구조로 태그를 입힙니다."""
+    """단독 대본일지라도 2인 대화 모드가 켜져 있으면 남성 진행자부터 시작하는 교대 구조로 변환합니다."""
     if "진행자:" in script_text or "파트너:" in script_text:
         return script_text
     sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', script_text.strip()) if s.strip()]
@@ -681,11 +808,53 @@ def _auto_convert_to_two_speaker(script_text):
         lines.append(f"{spk}: {s}")
     return "\n".join(lines)
 
+def enforce_opening_greeting(slides_data, dialogue_mode=True):
+    """
+    모든 생성·확장 완료 직후 첫 번째 슬라이드(slides_data[0])의 첫 문장이
+    반드시 '안녕하십니까, 식품안전팀 곽정혁입니다.'(남성 진행자 발화)로 시작하도록 강제 보정합니다.
+    """
+    if not slides_data:
+        return slides_data
+
+    first_sc = str(slides_data[0].get("script", "")).strip()
+    compact_head = re.sub(r'[\s,!\.]', '', first_sc[:85])
+    has_kwak = ("식품안전팀곽정혁입니다" in compact_head)
+
+    greeting_regex = re.compile(
+        r'^(네[,\s]*)?(안녕하십니까|안녕하세요|반갑습니다)[,!\.\s]*'
+        r'(연세유업\s*아산공장\s*임직원\s*여러분[,!\.\s]*)?'
+        r'(품질안전부문\s*)?식품안전팀\s*곽정혁\s*(주임\s*)?입니다[,!\.\s]*'
+    )
+    generic_hello_regex = re.compile(r'^(네[,\s]*)?(안녕하십니까|안녕하세요|반갑습니다)[,!\.\s]*')
+
+    if dialogue_mode:
+        if first_sc.startswith("파트너:"):
+            slides_data[0]["script"] = f"진행자: {MANDATORY_OPENING_LINE}\n{first_sc}"
+        elif first_sc.startswith("진행자:"):
+            after_tag = first_sc[len("진행자:"):].strip()
+            if has_kwak:
+                after_tag = greeting_regex.sub("", after_tag).strip()
+            else:
+                after_tag = generic_hello_regex.sub("", after_tag).strip()
+            slides_data[0]["script"] = f"진행자: {MANDATORY_OPENING_LINE} {after_tag}".strip()
+        else:
+            cleaned = greeting_regex.sub("", first_sc).strip() if has_kwak else generic_hello_regex.sub("", first_sc).strip()
+            slides_data[0]["script"] = f"진행자: {MANDATORY_OPENING_LINE} {cleaned}".strip()
+    else:
+        solo_sc = re.sub(r'^(진행자|파트너)\s*:\s*', '', first_sc).strip()
+        if has_kwak:
+            solo_sc = greeting_regex.sub("", solo_sc).strip()
+        else:
+            solo_sc = generic_hello_regex.sub("", solo_sc).strip()
+        slides_data[0]["script"] = f"{MANDATORY_OPENING_LINE} {solo_sc}".strip()
+
+    return slides_data
+
 def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=False):
     """
-    1순위: 유료 Gemini Native TTS (NotebookLM 동일 계열 - 2인 남녀 대화 티키타카 & 단독 성우 완벽 지원)
-    2순위: OpenAI TTS
-    3순위: Microsoft Edge Neural TTS (6종 보이스)
+    1순위: 유료 Gemini Native TTS (남성 진행자 고정 2인 대화 & 남성 단독 성우 지원)
+    2순위: OpenAI TTS (남성 중심 보이스)
+    3순위: Microsoft Edge Neural TTS (남성 중심 신경망 보이스)
     """
     clean_script = re.sub(r'[\*\#\[\]]', ' ', str(script_text)).strip()
     if not clean_script:
@@ -693,13 +862,13 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
 
     engine = tts_config.get("engine", "Gemini TTS")
     gemini_key = tts_config.get("gemini_key", GEMINI_API_KEY).strip()
-    gemini_voice = tts_config.get("gemini_voice", "Kore")
-    gemini_partner_voice = tts_config.get("gemini_partner_voice", "Puck")
+    gemini_voice = tts_config.get("gemini_voice", "Puck")
+    gemini_partner_voice = tts_config.get("gemini_partner_voice", "Kore")
     gemini_dialogue = tts_config.get("gemini_dialogue", True)
     openai_key = tts_config.get("openai_key", "").strip()
-    openai_voice = tts_config.get("openai_voice", "nova")
+    openai_voice = tts_config.get("openai_voice", "echo")
     openai_model = tts_config.get("openai_model", "gpt-4o-mini-tts")
-    edge_voice = tts_config.get("edge_voice", "ko-KR-SunHiNeural")
+    edge_voice = tts_config.get("edge_voice", "ko-KR-InJoonNeural")
     edge_pitch = tts_config.get("edge_pitch", "+0Hz")
     speed_rate = float(tts_config.get("speed", 1.00))
     err_memo = ""
@@ -715,7 +884,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
         if gemini_dialogue:
             dialogue_script = _auto_convert_to_two_speaker(clean_script)
             tts_input_text = (
-                "아래 대본을 실제 인기 라디오나 사내 팟캐스트에서 두 명의 진행자가 눈을 맞추며 유쾌하고 생동감 있게 대화하듯 자연스러운 한국어 구어체 호흡으로 읽어주세요:\n\n"
+                "아래 대본을 실제 인기 라디오나 사내 위생교육 방송에서 남성 메인 진행자(식품안전팀 곽정혁)와 보조 파트너가 마주 앉아 생동감 있게 대화하듯 자연스러운 한국어 구어체 호흡으로 읽어주세요:\n\n"
                 + dialogue_script
             )
             speech_cfg = types.SpeechConfig(
@@ -739,7 +908,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
         else:
             solo_clean = clean_script.replace("진행자:", "").replace("파트너:", "").strip()
             tts_input_text = (
-                "실제 사내 위생교육 전문 강사가 현장 임직원들과 친근하게 눈을 맞추며 이야기하듯 자연스러운 한국어 구어체 억양과 호흡으로 읽어주세요:\n\n"
+                "실제 사내 위생교육 남성 전문 강사(식품안전팀 곽정혁)가 현장 임직원들과 친근하게 눈을 맞추며 이야기하듯 자연스러운 한국어 구어체 억양과 호흡으로 읽어주세요:\n\n"
                 + solo_clean
             )
             speech_cfg = types.SpeechConfig(
@@ -765,7 +934,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
                                 raw_b = base64.b64decode(part.inline_data.data) if isinstance(part.inline_data.data, str) else part.inline_data.data
                                 m_type = getattr(part.inline_data, "mime_type", "audio/pcm")
                                 if _pcm_or_wav_to_mp3(raw_b, m_type, output_path, speed_rate=speed_rate):
-                                    mode_tag = f"NotebookLM 2인 대화 ({gemini_voice}+{gemini_partner_voice})" if gemini_dialogue else f"단독 ({gemini_voice})"
+                                    mode_tag = f"NotebookLM 2인 대화 (남성진행 {gemini_voice}+파트너 {gemini_partner_voice})" if gemini_dialogue else f"남성 단독 ({gemini_voice})"
                                     meta = {"used_engine": f"Gemini Native TTS ({gm_name} · {mode_tag})", "warning": ""}
                                     return (output_path, meta) if return_meta else output_path
                     break
@@ -789,7 +958,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
             for ch_txt in chunks:
                 payload = {"model": m_try, "input": ch_txt, "voice": safe_voice, "response_format": "mp3", "speed": speed_rate}
                 if m_try == "gpt-4o-mini-tts":
-                    payload["instructions"] = "실제 인기 팟캐스트 진행자처럼 아주 자연스럽고 생동감 있는 한국어 구어체로 대화하듯 말하세요."
+                    payload["instructions"] = "실제 사내 위생교육 전문 남성 강사처럼 자연스럽고 생동감 있는 한국어 구어체로 대화하듯 말하세요."
                 try:
                     resp = requests.post("https://api.openai.com/v1/audio/speech", headers=headers, json=payload, timeout=90)
                     if resp.status_code == 400 and "speed" in payload:
@@ -812,7 +981,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
                 meta = {"used_engine": f"OpenAI TTS ({m_try} / {safe_voice})", "warning": ""}
                 return (output_path, meta) if return_meta else output_path
 
-    # 3) Edge Neural TTS 폴백
+    # 3) Edge Neural TTS 폴백 (남성 보이스 기본)
     if EDGE_TTS_AVAILABLE:
         try:
             pct = int(round((speed_rate - 1.0) * 100))
@@ -836,7 +1005,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
                 loop.close()
 
             if os.path.exists(output_path) and os.path.getsize(output_path) > 500:
-                warn_txt = f"선택 엔진 응답 오류({err_memo})로 신경망 성우({edge_voice})로 전환되었습니다." if "Edge" not in engine else ""
+                warn_txt = f"선택 엔진 응답 오류({err_memo})로 남성 신경망 성우({edge_voice})로 전환되었습니다." if "Edge" not in engine else ""
                 meta = {"used_engine": f"Edge Neural TTS ({edge_voice})", "warning": warn_txt}
                 return (output_path, meta) if return_meta else output_path
         except Exception as edge_ex:
@@ -848,7 +1017,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
     return (output_path, meta) if return_meta else output_path
 
 # ==========================================
-# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진
+# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진 (전 구간 Auto-Fit 잘림 0%)
 # ==========================================
 def paste_image_contain(base_img, img_bytes, box_coords, bg_color=(248, 250, 252)):
     x1, y1, x2, y2 = box_coords
@@ -927,28 +1096,36 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
 
     f_hero = load_pil_font(title_font_name, 70, is_bold=True, custom_font_paths=custom_paths)
     f_quote = load_pil_font(title_font_name, 64, is_bold=True, custom_font_paths=custom_paths)
-    f_title = load_pil_font(title_font_name, 48, is_bold=True, custom_font_paths=custom_paths)
-    f_sub = load_pil_font(title_font_name, 33, is_bold=True, custom_font_paths=custom_paths)
     f_card_title = load_pil_font(title_font_name, 30, is_bold=True, custom_font_paths=custom_paths)
     f_badge_dept = load_pil_font(title_font_name, 21, is_bold=True, custom_font_paths=custom_paths)
     f_badge_role = load_pil_font(title_font_name, 27, is_bold=True, custom_font_paths=custom_paths)
-    f_body = load_pil_font(body_font_name, 26, is_bold=False, custom_font_paths=custom_paths)
     f_small = load_pil_font(body_font_name, 22, is_bold=False, custom_font_paths=custom_paths)
-    f_metric = load_pil_font(title_font_name, 64, is_bold=True, custom_font_paths=custom_paths)
 
     layout = slide_data.get("layout", "SPLIT_VISUAL")
     is_light = "10월" in theme_mode
     leader_photos = leader_photos or {}
 
+    # 1) 당부말씀 슬라이드 (긴 말씀도 100% 다 들어가도록 Auto-Fit 적용)
     if layout in ("INTRO_1TOP_3BOT", "INTRO_4GRID"):
         draw.rectangle([(0, 0), (width, height)], fill=(244, 246, 250))
         title_txt = slide_data.get("title", "월간 위생교육 전 당부말씀")
-        draw.text((62, 34), title_txt, font=f_title, fill=(15, 23, 42))
+        draw_autofit_textbox(
+            draw,
+            title_txt,
+            (62, 26, 1858, 104),
+            title_font_name,
+            max_font_size=48,
+            min_font_size=26,
+            fill=(15, 23, 42),
+            is_bold=True,
+            custom_font_paths=custom_paths,
+            valign="center"
+        )
 
         cards = slide_data.get("cards", [])
         top_card = cards[0] if len(cards) > 0 else {"header": "생산본부", "sub": "생산본부장", "body": ""}
 
-        tx1, ty1, tx2, ty2 = 60, 118, 1860, 396
+        tx1, ty1, tx2, ty2 = 60, 114, 1860, 400
         red_col = (220, 38, 38)
         draw.rounded_rectangle([(tx1 + 4, ty1 + 5), (tx2 + 4, ty2 + 5)], radius=20, fill=(215, 222, 232))
         draw.rounded_rectangle([(tx1, ty1), (tx2, ty2)], radius=20, fill=(255, 255, 255), outline=(218, 226, 236), width=3)
@@ -971,14 +1148,22 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             draw.text((cx_top - (b2[2] - b2[0]) // 2, cy_top + 4), role_top, font=f_badge_role, fill=(15, 23, 42))
             divider_x = tx1 + 230
 
-        draw.line([(divider_x, ty1 + 38), (divider_x, ty2 - 38)], fill=(226, 232, 240), width=3)
-        draw.text((divider_x + 22, ty1 + 20), "“", font=f_quote, fill=(203, 213, 225))
+        draw.line([(divider_x, ty1 + 32), (divider_x, ty2 - 32)], fill=(226, 232, 240), width=3)
+        draw.text((divider_x + 18, ty1 + 16), "“", font=f_quote, fill=(203, 213, 225))
 
-        top_body_lines = wrap_text_by_pixel(top_card.get("body", ""), f_small, (tx2 - divider_x) - 105, draw)
-        t_y = ty1 + 42
-        for line in top_body_lines[:5]:
-            draw.text((divider_x + 76, t_y), line, font=f_small, fill=(30, 41, 59))
-            t_y += 38
+        draw_autofit_textbox(
+            draw,
+            top_card.get("body", ""),
+            (divider_x + 70, ty1 + 24, tx2 - 32, ty2 - 22),
+            body_font_name,
+            max_font_size=23,
+            min_font_size=12,
+            fill=(30, 41, 59),
+            is_bold=False,
+            custom_font_paths=custom_paths,
+            valign="center",
+            line_spacing_ratio=0.34
+        )
 
         bottom_defaults = [
             ("유제품생산부문", "유제품생산부문장"),
@@ -988,7 +1173,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         navy_col = (15, 62, 124)
         card_w = 576
         gap_x = 36
-        by1, by2 = 426, 1036
+        by1, by2 = 424, 1044
 
         for i in range(3):
             bx1 = 60 + i * (card_w + gap_x)
@@ -1003,7 +1188,7 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             draw.rounded_rectangle([(bx1, by1), (bx2, by2)], radius=20, fill=(255, 255, 255), outline=(218, 226, 236), width=3)
             draw.rounded_rectangle([(bx1, by1), (bx1 + 14, by2)], radius=7, fill=navy_col)
 
-            cx_b, cy_b, r_b = bx1 + 84, by1 + 78, 52
+            cx_b, cy_b, r_b = bx1 + 84, by1 + 76, 52
             has_b_photo = paste_circular_avatar(img, leader_photos.get(def_dept), cx_b, cy_b, r_b, navy_col, border_width=5)
             if not has_b_photo:
                 draw.ellipse([(cx_b - r_b, cy_b - r_b), (cx_b + r_b, cy_b + r_b)], fill=(255, 255, 255), outline=navy_col, width=5)
@@ -1011,22 +1196,29 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                 bb_tag = draw.textbbox((0, 0), short_tag, font=f_badge_dept)
                 draw.text((cx_b - (bb_tag[2] - bb_tag[0]) // 2, cy_b - 12), short_tag, font=f_badge_dept, fill=navy_col)
 
-            draw.text((bx1 + 154, by1 + 42), dept_str, font=f_badge_dept, fill=(100, 116, 139))
-            draw.text((bx1 + 154, by1 + 72), role_str, font=f_card_title, fill=(15, 23, 42))
-            draw.text((bx2 - 68, by1 + 22), "“", font=f_quote, fill=(203, 213, 225))
-            draw.line([(bx1 + 32, by1 + 146), (bx2 - 32, by1 + 146)], fill=(235, 240, 246), width=2)
+            draw.text((bx1 + 154, by1 + 40), dept_str, font=f_badge_dept, fill=(100, 116, 139))
+            draw.text((bx1 + 154, by1 + 70), role_str, font=f_card_title, fill=(15, 23, 42))
+            draw.text((bx2 - 68, by1 + 20), "“", font=f_quote, fill=(203, 213, 225))
+            draw.line([(bx1 + 32, by1 + 142), (bx2 - 32, by1 + 142)], fill=(235, 240, 246), width=2)
 
-            b_lines = wrap_text_by_pixel(body_str, f_small, card_w - 68, draw)
-            cy_text = by1 + 168
-            for line in b_lines[:11]:
-                if cy_text > by2 - 34:
-                    break
-                draw.text((bx1 + 36, cy_text), line, font=f_small, fill=(45, 55, 72))
-                cy_text += 37
+            draw_autofit_textbox(
+                draw,
+                body_str,
+                (bx1 + 34, by1 + 156, bx2 - 28, by2 - 22),
+                body_font_name,
+                max_font_size=22,
+                min_font_size=11,
+                fill=(45, 55, 72),
+                is_bold=False,
+                custom_font_paths=custom_paths,
+                valign="top",
+                line_spacing_ratio=0.34
+            )
 
         img.save(output_path, quality=95)
         return output_path
 
+    # 2) 이벤트 안내 고정 양식 슬라이드
     if layout == "OUTRO_EVENT":
         draw_background_grid_hd(draw, width, height, "10월 스타일")
 
@@ -1091,11 +1283,23 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                 w1 = draw.textbbox((0, 0), seg1, font=f_ev_row)[2]
                 draw.text((tx_start + w1, ty_text), seg2, font=f_ev_row, fill=(30, 41, 59))
             else:
-                draw.text((tx_start, ty_text), ev_closing, font=f_ev_row, fill=(30, 41, 59))
+                draw_autofit_textbox(
+                    draw,
+                    ev_closing,
+                    (tx_start, by + 18, bar_x2 - 24, by + bar_h - 18),
+                    title_font_name,
+                    max_font_size=36,
+                    min_font_size=20,
+                    fill=(30, 41, 59),
+                    is_bold=True,
+                    custom_font_paths=custom_paths,
+                    valign="center"
+                )
 
         img.save(output_path, quality=95)
         return output_path
 
+    # 3) 표지 및 본론 슬라이드 (모든 박스·표·하단 배너 Auto-Fit 적용)
     draw_background_grid_hd(draw, width, height, theme_mode)
     text_main_col = (15, 23, 42) if is_light else (248, 250, 252)
     text_sub_col = (51, 65, 85) if is_light else (203, 213, 225)
@@ -1112,21 +1316,37 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         text_max_w = 960 if has_cover_vis else 1500
 
         badge_txt = "YONSEI DAIRY | FOOD SAFETY & HACCP EDUCATION"
-        draw.text((box_x1 + 85, box_y1 + 80), badge_txt, font=f_card_title, fill=(2, 132, 199) if is_light else (52, 211, 153))
+        draw.text((box_x1 + 85, box_y1 + 76), badge_txt, font=f_card_title, fill=(2, 132, 199) if is_light else (52, 211, 153))
 
         main_title = slide_data.get("title", "정기 위생교육")
-        t_lines = wrap_text_by_pixel(main_title, f_hero, text_max_w, draw)
-        ty = box_y1 + 165
-        for tl in t_lines[:3]:
-            draw.text((box_x1 + 85, ty), tl, font=f_hero, fill=text_main_col)
-            ty += 96
+        title_end_y = draw_autofit_textbox(
+            draw,
+            main_title,
+            (box_x1 + 85, box_y1 + 150, box_x1 + 85 + text_max_w, box_y1 + 460),
+            title_font_name,
+            max_font_size=68,
+            min_font_size=32,
+            fill=text_main_col,
+            is_bold=True,
+            custom_font_paths=custom_paths,
+            valign="center",
+            line_spacing_ratio=0.25
+        )
 
         sub_txt = slide_data.get("subtitle", "") or slide_data.get("content", "")
-        s_lines = wrap_text_by_pixel(sub_txt, f_sub, text_max_w, draw)
-        sy = ty + 30
-        for sl in s_lines[:3]:
-            draw.text((box_x1 + 85, sy), sl, font=f_sub, fill=text_sub_col)
-            sy += 52
+        if sub_txt:
+            draw_autofit_textbox(
+                draw,
+                sub_txt,
+                (box_x1 + 85, max(box_y1 + 470, title_end_y + 20), box_x1 + 85 + text_max_w, box_y2 - 155),
+                title_font_name,
+                max_font_size=33,
+                min_font_size=18,
+                fill=text_sub_col,
+                is_bold=True,
+                custom_font_paths=custom_paths,
+                valign="top"
+            )
 
         if has_cover_vis:
             cx1, cy1, cx2, cy2 = box_x2 - 610, box_y1 + 90, box_x2 - 70, box_y1 + 630
@@ -1139,24 +1359,50 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         img.save(output_path, quality=95)
         return output_path
 
+    # 공통 상단 타이틀 바 (긴 제목도 잘리지 않도록 Auto-Fit)
     header_bg = (30, 58, 138) if is_light else (15, 28, 48)
-    draw.rectangle([(60, 46), (1860, 152)], fill=header_bg, outline=card_border_col, width=3)
-    draw.rectangle([(60, 46), (82, 152)], fill=(56, 189, 248) if is_light else (16, 185, 129))
-    draw.text((108, 70), slide_data.get("title", f"슬라이드 {slide_idx + 1}"), font=f_title, fill=(255, 255, 255))
+    draw.rectangle([(60, 44), (1860, 150)], fill=header_bg, outline=card_border_col, width=3)
+    draw.rectangle([(60, 44), (82, 150)], fill=(56, 189, 248) if is_light else (16, 185, 129))
+    draw_autofit_textbox(
+        draw,
+        slide_data.get("title", f"슬라이드 {slide_idx + 1}"),
+        (108, 52, 1838, 142),
+        title_font_name,
+        max_font_size=46,
+        min_font_size=24,
+        fill=(255, 255, 255),
+        is_bold=True,
+        custom_font_paths=custom_paths,
+        valign="center"
+    )
+
+    has_bottom_banner = bool(str(slide_data.get("bottom_summary", "")).strip())
+    content_bottom_y = 964 if has_bottom_banner else 994
 
     if layout == "TABLE_MATRIX" and slide_data.get("table_headers") and slide_data.get("table_rows"):
         headers = slide_data["table_headers"]
         rows = slide_data["table_rows"]
         col_cnt = max(1, len(headers))
-        table_x1, table_y1, table_x2, table_y2 = 65, 184, 1855, 972
+        table_x1, table_y1, table_x2, table_y2 = 65, 178, 1855, content_bottom_y
         col_w = (table_x2 - table_x1) // col_cnt
 
-        th_h = 84
+        th_h = 80
         for c_i, h_text in enumerate(headers):
             cx1 = table_x1 + c_i * col_w
             cx2 = table_x2 if c_i == col_cnt - 1 else (cx1 + col_w)
             draw.rectangle([(cx1, table_y1), (cx2, table_y1 + th_h)], fill=(30, 64, 175) if is_light else (6, 78, 59), outline=card_border_col, width=3)
-            draw.text((cx1 + 24, table_y1 + 24), str(h_text), font=f_card_title, fill=(255, 255, 255))
+            draw_autofit_textbox(
+                draw,
+                str(h_text),
+                (cx1 + 18, table_y1 + 10, cx2 - 18, table_y1 + th_h - 10),
+                title_font_name,
+                max_font_size=28,
+                min_font_size=15,
+                fill=(255, 255, 255),
+                is_bold=True,
+                custom_font_paths=custom_paths,
+                valign="center"
+            )
 
         row_cnt = max(1, len(rows))
         avail_h = table_y2 - (table_y1 + th_h)
@@ -1170,17 +1416,21 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                 cx2 = table_x2 if c_i == col_cnt - 1 else (cx1 + col_w)
                 cell_txt = str(r_data[c_i]) if c_i < len(r_data) else ""
                 draw.rectangle([(cx1, ry1), (cx2, ry2)], fill=row_bg, outline=card_border_col, width=2)
-                c_font = f_card_title if c_i == 0 else f_body
-                c_lines = wrap_text_by_pixel(cell_txt, c_font, col_w - 42, draw)
-                cy = ry1 + 20
-                for cl in c_lines:
-                    if cy > ry2 - 36:
-                        break
-                    draw.text((cx1 + 22, cy), cl, font=c_font, fill=text_main_col if c_i == 0 else text_sub_col)
-                    cy += 39
+                draw_autofit_textbox(
+                    draw,
+                    cell_txt,
+                    (cx1 + 18, ry1 + 10, cx2 - 18, ry2 - 10),
+                    title_font_name if c_i == 0 else body_font_name,
+                    max_font_size=27 if c_i == 0 else 25,
+                    min_font_size=12,
+                    fill=text_main_col if c_i == 0 else text_sub_col,
+                    is_bold=(c_i == 0),
+                    custom_font_paths=custom_paths,
+                    valign="center"
+                )
 
     elif layout == "SPLIT_VISUAL" or slide_data.get("visual_bytes"):
-        vx1, vy1, vx2, vy2 = 65, 184, 915, 970
+        vx1, vy1, vx2, vy2 = 65, 178, 915, content_bottom_y
         draw.rounded_rectangle([(vx1, vy1), (vx2, vy2)], radius=18, fill=card_bg_col, outline=card_border_col, width=4)
 
         v_bytes = slide_data.get("visual_bytes")
@@ -1200,30 +1450,67 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             cards = [{"header": "핵심 위생 관리 포인트", "body": slide_data.get("content", "")}]
         rx1, rx2 = 950, 1855
         c_cnt = min(len(cards), 3)
-        gap = 24
-        card_h = (786 - gap * (max(1, c_cnt) - 1)) // max(1, c_cnt)
+        gap = 22
+        total_cards_h = content_bottom_y - 178
+        card_h = (total_cards_h - gap * (max(1, c_cnt) - 1)) // max(1, c_cnt)
         for i, c_item in enumerate(cards[:c_cnt]):
-            cy1 = 184 + i * (card_h + gap)
+            cy1 = 178 + i * (card_h + gap)
             cy2 = cy1 + card_h
             draw.rounded_rectangle([(rx1, cy1), (rx2, cy2)], radius=16, fill=card_bg_col, outline=card_border_col, width=3)
             draw.rectangle([(rx1, cy1), (rx1 + 18, cy2)], fill=card_border_col)
 
             header_str = c_item.get("header", f"핵심 기준 {i+1}")
             metric_str = str(c_item.get("metric", "")).strip()
-            draw.text((rx1 + 38, cy1 + 22), header_str, font=f_card_title, fill=card_border_col if is_light else (52, 211, 153))
-            if metric_str:
-                m_bb = draw.textbbox((0, 0), metric_str, font=f_card_title)
-                mw = m_bb[2] - m_bb[0]
-                draw.rounded_rectangle([(rx2 - mw - 56, cy1 + 18), (rx2 - 24, cy1 + 60)], radius=8, fill=(254, 226, 226) if is_light else (127, 29, 29))
-                draw.text((rx2 - mw - 40, cy1 + 22), metric_str, font=f_card_title, fill=(220, 38, 38) if is_light else (254, 202, 202))
+            header_right_x = rx2 - 24
 
-            b_lines = wrap_text_by_pixel(c_item.get("body", ""), f_body, (rx2 - rx1) - 68, draw)
-            by = cy1 + 74
-            for bl in b_lines:
-                if by > cy2 - 36:
-                    break
-                draw.text((rx1 + 38, by), bl, font=f_body, fill=text_sub_col)
-                by += 40
+            if metric_str:
+                # 뱃지 폭이 너무 넓어 제목을 침범하지 않도록 최대 290px 내 자동 맞춤
+                f_badge_m = load_pil_font(title_font_name, 25, is_bold=True, custom_font_paths=custom_paths)
+                m_bb = draw.textbbox((0, 0), metric_str, font=f_badge_m)
+                mw = min(290, (m_bb[2] - m_bb[0]))
+                bx_left = rx2 - mw - 52
+                draw.rounded_rectangle([(bx_left, cy1 + 14), (rx2 - 20, cy1 + 60)], radius=8, fill=(254, 226, 226) if is_light else (127, 29, 29))
+                draw_autofit_textbox(
+                    draw,
+                    metric_str,
+                    (bx_left + 12, cy1 + 17, rx2 - 32, cy1 + 57),
+                    title_font_name,
+                    max_font_size=25,
+                    min_font_size=14,
+                    fill=(220, 38, 38) if is_light else (254, 202, 202),
+                    is_bold=True,
+                    custom_font_paths=custom_paths,
+                    align="center",
+                    valign="center"
+                )
+                header_right_x = bx_left - 14
+
+            draw_autofit_textbox(
+                draw,
+                header_str,
+                (rx1 + 36, cy1 + 14, max(rx1 + 180, header_right_x), cy1 + 64),
+                title_font_name,
+                max_font_size=29,
+                min_font_size=16,
+                fill=card_border_col if is_light else (52, 211, 153),
+                is_bold=True,
+                custom_font_paths=custom_paths,
+                valign="center"
+            )
+
+            draw_autofit_textbox(
+                draw,
+                c_item.get("body", ""),
+                (rx1 + 36, cy1 + 70, rx2 - 26, cy2 - 16),
+                body_font_name,
+                max_font_size=25,
+                min_font_size=12,
+                fill=text_sub_col,
+                is_bold=False,
+                custom_font_paths=custom_paths,
+                valign="top",
+                line_spacing_ratio=0.30
+            )
 
     else:
         cards = slide_data.get("cards", [])
@@ -1233,25 +1520,43 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
 
         c_cnt = min(len(cards), 5)
         if c_cnt == 4 and layout == "SELF_AUDIT_2X2":
+            mid_y = (178 + content_bottom_y) // 2
             grid_coords = [
-                (65, 184, 940, 564),
-                (980, 184, 1855, 564),
-                (65, 590, 940, 970),
-                (980, 590, 1855, 970)
+                (65, 178, 940, mid_y - 12),
+                (980, 178, 1855, mid_y - 12),
+                (65, mid_y + 12, 940, content_bottom_y),
+                (980, mid_y + 12, 1855, content_bottom_y)
             ]
             for i in range(4):
                 gx1, gy1, gx2, gy2 = grid_coords[i]
                 c_item = cards[i]
                 draw.rounded_rectangle([(gx1, gy1), (gx2, gy2)], radius=18, fill=card_bg_col, outline=card_border_col, width=3)
-                draw.rectangle([(gx1, gy1), (gx2, gy1 + 68)], fill=header_bg)
-                draw.text((gx1 + 28, gy1 + 17), c_item.get("header", ""), font=f_card_title, fill=(255, 255, 255))
-                b_lines = wrap_text_by_pixel(c_item.get("body", ""), f_body, (gx2 - gx1) - 56, draw)
-                by = gy1 + 90
-                for bl in b_lines:
-                    if by > gy2 - 38:
-                        break
-                    draw.text((gx1 + 28, by), bl, font=f_body, fill=text_sub_col)
-                    by += 42
+                draw.rectangle([(gx1, gy1), (gx2, gy1 + 66)], fill=header_bg)
+                draw_autofit_textbox(
+                    draw,
+                    c_item.get("header", ""),
+                    (gx1 + 26, gy1 + 10, gx2 - 26, gy1 + 58),
+                    title_font_name,
+                    max_font_size=29,
+                    min_font_size=16,
+                    fill=(255, 255, 255),
+                    is_bold=True,
+                    custom_font_paths=custom_paths,
+                    valign="center"
+                )
+                draw_autofit_textbox(
+                    draw,
+                    c_item.get("body", ""),
+                    (gx1 + 28, gy1 + 78, gx2 - 26, gy2 - 16),
+                    body_font_name,
+                    max_font_size=25,
+                    min_font_size=12,
+                    fill=text_sub_col,
+                    is_bold=False,
+                    custom_font_paths=custom_paths,
+                    valign="top",
+                    line_spacing_ratio=0.30
+                )
         else:
             total_w = 1790
             gap = 28
@@ -1259,38 +1564,79 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             for i, c_item in enumerate(cards[:c_cnt]):
                 cx1 = 65 + i * (card_w + gap)
                 cx2 = cx1 + card_w
-                cy1, cy2 = 184, 970
+                cy1, cy2 = 178, content_bottom_y
                 draw.rounded_rectangle([(cx1, cy1), (cx2, cy2)], radius=18, fill=card_bg_col, outline=card_border_col, width=4)
                 draw.rectangle([(cx1, cy1), (cx2, cy1 + 84)], fill=header_bg)
-                h_lines = wrap_text_by_pixel(c_item.get("header", f"STEP {i+1}"), f_card_title, card_w - 36, draw)
-                if h_lines:
-                    draw.text((cx1 + 22, cy1 + 24), h_lines[0], font=f_card_title, fill=(255, 255, 255))
+                draw_autofit_textbox(
+                    draw,
+                    c_item.get("header", f"STEP {i+1}"),
+                    (cx1 + 20, cy1 + 10, cx2 - 20, cy1 + 76),
+                    title_font_name,
+                    max_font_size=29,
+                    min_font_size=15,
+                    fill=(255, 255, 255),
+                    is_bold=True,
+                    custom_font_paths=custom_paths,
+                    valign="center"
+                )
 
-                by = cy1 + 114
+                body_top_y = cy1 + 104
                 metric_str = str(c_item.get("metric", "")).strip()
                 if metric_str:
-                    m_lines = wrap_text_by_pixel(metric_str, f_metric, card_w - 36, draw)
-                    for ml in m_lines[:2]:
-                        draw.text((cx1 + 26, by), ml, font=f_metric, fill=(239, 68, 68))
-                        by += 80
-                    draw.line([(cx1 + 26, by + 10), (cx2 - 26, by + 10)], fill=card_border_col, width=3)
-                    by += 32
+                    draw_autofit_textbox(
+                        draw,
+                        metric_str,
+                        (cx1 + 24, cy1 + 98, cx2 - 24, cy1 + 220),
+                        title_font_name,
+                        max_font_size=56,
+                        min_font_size=22,
+                        fill=(239, 68, 68),
+                        is_bold=True,
+                        custom_font_paths=custom_paths,
+                        valign="center"
+                    )
+                    draw.line([(cx1 + 24, cy1 + 232), (cx2 - 24, cy1 + 232)], fill=card_border_col, width=3)
+                    body_top_y = cy1 + 250
 
-                b_lines = wrap_text_by_pixel(c_item.get("body", ""), f_body, card_w - 48, draw)
-                for bl in b_lines:
-                    if by > cy2 - 42:
-                        break
-                    draw.text((cx1 + 24, by), bl, font=f_body, fill=text_sub_col)
-                    by += 43
+                draw_autofit_textbox(
+                    draw,
+                    c_item.get("body", ""),
+                    (cx1 + 24, body_top_y, cx2 - 22, cy2 - 18),
+                    body_font_name,
+                    max_font_size=25,
+                    min_font_size=12,
+                    fill=text_sub_col,
+                    is_bold=False,
+                    custom_font_paths=custom_paths,
+                    valign="top",
+                    line_spacing_ratio=0.30
+                )
 
-    bottom_banner = slide_data.get("bottom_summary", "")
+    # 하단 핵심 원칙 배너 (긴 문장도 2~3줄 자동 축소·중앙 정렬되어 끝까지 100% 표시)
+    bottom_banner = str(slide_data.get("bottom_summary", "")).strip()
     if bottom_banner:
-        draw.rounded_rectangle([(65, 990), (1670, 1054)], radius=12, fill=(254, 242, 242) if is_light else (6, 78, 59), outline=(239, 68, 68) if is_light else (16, 185, 129), width=3)
-        b_sum_lines = wrap_text_by_pixel(f"핵심 원칙: {bottom_banner}", f_body, 1560, draw)
-        if b_sum_lines:
-            draw.text((92, 1006), b_sum_lines[0], font=f_body, fill=(185, 28, 28) if is_light else (255, 255, 255))
+        draw.rounded_rectangle(
+            [(65, 978), (1685, 1064)],
+            radius=12,
+            fill=(254, 242, 242) if is_light else (6, 78, 59),
+            outline=(239, 68, 68) if is_light else (16, 185, 129),
+            width=3
+        )
+        draw_autofit_textbox(
+            draw,
+            f"핵심 원칙: {bottom_banner}",
+            (90, 984, 1665, 1058),
+            body_font_name,
+            max_font_size=25,
+            min_font_size=13,
+            fill=(185, 28, 28) if is_light else (255, 255, 255),
+            is_bold=False,
+            custom_font_paths=custom_paths,
+            valign="center",
+            line_spacing_ratio=0.22
+        )
 
-    draw.text((width - 210, height - 52), f"Page {slide_idx + 1} / {total_slides}", font=f_small, fill=text_sub_col)
+    draw.text((width - 205, height - 50), f"Page {slide_idx + 1} / {total_slides}", font=f_small, fill=text_sub_col)
     img.save(output_path, quality=95)
     return output_path
 
@@ -1330,8 +1676,8 @@ def build_fixed_event_slide(month_int, rank1, rank2, rank3, prize_amount="10,000
     ranks_str = f"{rank1}번째, {rank2}번째, {rank3}번째"
     if dialogue_mode:
         script_text = (
-            f"진행자: 자, 오늘 함께 살펴본 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 아산공장 임직원 여러분 정말 고생 많으셨어요.\n"
-            f"파트너: 맞습니다! 그리고 여러분이 가장 기다리시는 시간이죠, {month_str} 위생교육 퀴즈 이벤트 소식도 빠질 수 없잖아요?\n"
+            f"진행자: 자, 오늘 함께 살펴본 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 아산공장 임직원 여러분 정말 고생 많으셨습니다.\n"
+            f"파트너: 맞습니다! 그리고 여러분이 가장 기다리시는 시간이죠, {month_str} 위생교육 퀴즈 이벤트 소식도 안내해 주셔야죠!\n"
             f"진행자: 네, 이번 {month_str}에는 위생교육 퀴즈 만점자분들 중에서 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 {prize_amount} {prize_item} 혜택을 드립니다!\n"
             f"파트너: 오늘 배운 핵심 수칙들 가볍게 복습하시면서 지금 바로 퀴즈 참여하시고, 기분 좋은 커피 기프티콘의 주인공이 되어보세요! 오늘도 안전한 하루 보내세요, 감사합니다!"
         )
@@ -1377,28 +1723,32 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
     if intro_config["mode"] != "당부 말씀 슬라이드 생략":
         intro_instruction = f"""
         [슬라이드 1 (고정 오프닝: '월간 위생교육 전 당부말씀' - 상단 생산본부장 1단 와이드 + 하단 3개 부문장 3열 구조)]:
-        - 반드시 첫 번째 슬라이드는 "layout": "INTRO_1TOP_3BOT", "title": "월간 위생교육 전 당부말씀" 으로 설정하십시오.
-        - "cards" 배열에 정확히 아래 순서대로 4명의 리더 당부 말씀을 넣으십시오 (입력된 원문 유지):
+- 반드시 첫 번째 슬라이드는 "layout": "INTRO_1TOP_3BOT", "title": "월간 위생교육 전 당부말씀" 으로 설정하십시오.
+- "cards" 배열에 정확히 아래 순서대로 4명의 리더 당부 말씀을 넣으십시오 (입력된 원문을 단 한 글자도 요약·생략하지 말고 그대로 유지):
           1) {{"header": "생산본부", "sub": "생산본부장", "body": "..."}}
           2) {{"header": "유제품생산부문", "sub": "유제품생산부문장", "body": "..."}}
           3) {{"header": "상온제품생산부문", "sub": "상온제품생산부문장", "body": "..."}}
           4) {{"header": "품질안전부문", "sub": "품질안전부문장", "body": "..."}}
-        - [입력된 당부 말씀 원문]:\n{intro_config.get("custom_text", "")}
+- [입력된 당부 말씀 원문]:\n{intro_config.get("custom_text", "")}
         """
     else:
         intro_instruction = "[인트로 생략]: INTRO_1TOP_3BOT 없이 표지(COVER)부터 시작하십시오."
 
     if dialogue_mode:
-        script_style_rule = """
-        [성우 대본("script") 작성 절대 원칙 - NotebookLM 2인 티키타카 대화형]:
-        - 반드시 `진행자:`와 `파트너:` 두 명의 화자가 실제 스튜디오에서 마주 앉아 자연스럽게 묻고 답하며 맞장구치는 대화 형식으로 작성하십시오!
-        - 각 발화 줄 맨 앞에 정확히 `진행자: ` 또는 `파트너: `를 붙이고 줄바꿈(`\\n`)으로 구분하십시오.
-        - 기계적인 낭독투 대신 "어? 그런데 현장에서 이 부분은 왜 특히 조심해야 할까요?", "아, 그거 정말 중요한 포인트예요! 왜냐하면요," 같은 실제 사람의 호흡과 추임새를 살리되, 법적 수치와 팩트는 100% 정확히 전달하십시오.
+        script_style_rule = f"""
+        [성우 대본("script") 작성 절대 원칙 - NotebookLM 2인 티키타카 대화형 (남성 메인 진행자 고정)]:
+- 화자 역할 고정: `진행자:`는 교육을 주관하는 **'식품안전팀 곽정혁' 본인(남성 메인 진행자)**이고, `파트너:`는 함께 호흡을 맞추며 질문·공감하는 보조 진행자입니다!
+- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 발화는 반드시 `진행자: {MANDATORY_OPENING_LINE}` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 {edu_month_str} 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
+- 반드시 `진행자:`와 `파트너:` 두 명의 화자가 실제 스튜디오에서 마주 앉아 자연스럽게 묻고 답하며 맞장구치는 대화 형식으로 작성하십시오!
+- 각 발화 줄 맨 앞에 정확히 `진행자: ` 또는 `파트너: `를 붙이고 줄바꿈(`\\n`)으로 구분하십시오 (`진행자(곽정혁):`처럼 괄호를 넣지 마십시오).
+- 기계적인 낭독투 대신 "어? 그런데 현장에서 이 부분은 왜 특히 조심해야 할까요?", "아, 그거 정말 중요한 포인트예요! 왜냐하면요," 같은 실제 사람의 호흡과 추임새를 살리되, 법적 수치와 팩트는 100% 정확히 전달하십시오.
         """
     else:
-        script_style_rule = """
-        [성우 대본("script") 작성 절대 원칙 - 1인 전문 강사 구어체]:
-        - 문어체("~함", "~바랍니다")를 피하고, 실제 인기 강사가 현장 작업자와 눈을 맞추며 대화하듯 생동감 있는 구어체("~거든요", "자, 여기서 꼭 기억할 포인트가 있습니다!")와 호흡용 쉼표(,)를 꼼꼼히 넣어 작성하십시오.
+        script_style_rule = f"""
+        [성우 대본("script") 작성 절대 원칙 - 1인 남성 전문 강사 구어체]:
+- 화자는 교육을 주관하는 **'식품안전팀 곽정혁' 본인(남성 강사)**입니다.
+- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 문장은 반드시 `"{MANDATORY_OPENING_LINE}"` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 {edu_month_str} 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
+- 문어체("~함", "~바랍니다")를 피하고, 실제 인기 강사가 현장 작업자와 눈을 맞추며 대화하듯 생동감 있는 구어체("~거든요", "자, 여기서 꼭 기억할 포인트가 있습니다!")와 호흡용 쉼표(,)를 꼼꼼히 넣어 작성하십시오.
         """
 
     system_prompt = f"""
@@ -1414,14 +1764,14 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
     {intro_instruction}
 
     [시각화 및 레이아웃("layout") 배정 핵심 규칙]:
-    1. "COVER": 표지 슬라이드에도 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
-    2. "TOC_STEP": 3~5단계 전체 교육 목차 카드.
-    3. 본론 슬라이드({body_slide_count}장) 중 **최소 70% 이상을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하십시오!
-       - 카드 본문("body") 줄머리 기호는 폰트 깨짐이 없는 하이픈(`- `)만 사용하십시오 (`•`, `□` 사용 금지).
-       - "visual_prompt": 해당 슬라이드의 우측 카드("cards")에 적힌 설비·행동·위생 수칙이 하나의 3D 아이소메트릭 도면 안에 직관적으로 묘사되도록 구체적인 영문 프롬프트를 작성하고, `"strictly no text or letters"`를 포함하십시오.
-       - "CARDS_3COL": 핵심 수치 비교가 필요한 1~2장에 사용 ("metric" 필드에 짧은 강조 수치 기입).
-       - "TABLE_MATRIX": 기준표나 구역 비교 등 표가 필요한 1~2장에 사용 ("table_headers", "table_rows" 필수 작성).
-       - "SELF_AUDIT_2X2": 본론 가장 마지막 장은 현장 작업자용 '핵심 자가 진단 체크리스트' 4분할 카드로 구성하십시오 (각 줄 앞에 `[V] ` 표기).
+1. "COVER": 표지 슬라이드에도 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
+2. "TOC_STEP": 3~5단계 전체 교육 목차 카드.
+3. 본론 슬라이드({body_slide_count}장) 중 **최소 70% 이상을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하십시오!
+  - 카드 본문("body")과 하단 요약("bottom_summary")은 도중에 끊기지 않도록 **끝맺음이 명확하고 완결된 문장(또는 완결된 개조식 구문)**으로 작성하며, 줄머리 기호는 폰트 깨짐이 없는 하이픈(`- `)만 사용하십시오 (`•`, `□` 사용 금지).
+  - "visual_prompt": 해당 슬라이드의 우측 카드("cards")에 적힌 설비·행동·위생 수칙이 하나의 3D 아이소메트릭 도면 안에 직관적으로 묘사되도록 구체적인 영문 프롬프트를 작성하고, `"strictly no text or letters"`를 포함하십시오.
+  - "CARDS_3COL": 핵심 수치 비교가 필요한 1~2장에 사용 ("metric" 필드에 짧은 강조 수치 기입).
+  - "TABLE_MATRIX": 기준표나 구역 비교 등 표가 필요한 1~2장에 사용 ("table_headers", "table_rows" 필수 작성).
+  - "SELF_AUDIT_2X2": 본론 가장 마지막 장은 현장 작업자용 '핵심 자가 진단 체크리스트' 4분할 카드로 구성하십시오 (각 줄 앞에 `[V] ` 표기).
 
     {script_style_rule}
 
@@ -1485,13 +1835,18 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
                 continue
             return None, None, f"AI 기획안 생성 오류 ({PLANNING_MODEL}): {e}"
 
-def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dialogue_mode=True):
+def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dialogue_mode=True, has_intro_before=False):
     client = get_genai_client(GEMINI_API_KEY)
     slides_text_dump = "\n\n".join([f"[슬라이드 {p['page_num']} 텍스트]:\n{p['text']}" for p in pdf_pages_info])
+    first_page_rule = (
+        ""
+        if has_intro_before else
+        f"단, 슬라이드 1번의 가장 첫 문장은 반드시 '{'진행자: ' if dialogue_mode else ''}{MANDATORY_OPENING_LINE}' 로 시작하십시오."
+    )
     spk_rule = (
-        "반드시 `진행자:`와 `파트너:` 두 명이 자연스럽게 질문하고 맞장구치며 설명하는 NotebookLM 2인 팟캐스트 대화 형식으로 작성하십시오."
+        f"반드시 남성 메인 진행자(`진행자:` = 식품안전팀 곽정혁)와 보조 진행자(`파트너:`) 두 명이 자연스럽게 질문하고 맞장구치며 설명하는 NotebookLM 2인 팟캐스트 대화 형식으로 작성하십시오. {first_page_rule}"
         if dialogue_mode else
-        "실제 전문 강사가 현장 작업자들과 눈을 맞추며 친근하게 설명하는 1인 구어체 내레이션으로 작성하십시오."
+        f"실제 남성 전문 강사(식품안전팀 곽정혁)가 현장 작업자들과 눈을 맞추며 친근하게 설명하는 1인 구어체 내레이션으로 작성하십시오. {first_page_rule}"
     )
     prompt = f"""
     다음은 연세유업 아산공장 '{edu_month_str} 정기 위생교육 ({topic})' 슬라이드 총 {len(pdf_pages_info)}장의 텍스트입니다.
@@ -1542,9 +1897,9 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
     source_excerpt = extra_source_text[:6000] if extra_source_text else ""
 
     mode_guide = (
-        "반드시 `진행자: ...\\n파트너: ...` 형태의 2인 남녀 팟캐스트 티키타카 대화 형식을 유지하십시오! 한 슬라이드 안에서 진행자와 파트너가 4~6번 이상 자연스럽게 질문·공감·예시 설명을 주고받으며 진짜 사람끼리 대화하는 느낌을 극대화하십시오. (단, 발화자 이름 글자 수는 제외한 순수 대사 분량이 목표 글자 수를 넘어야 합니다.)"
+        f"반드시 `진행자: ...\\n파트너: ...` 형태의 2인 대담 형식을 유지하십시오! (`진행자:`는 남성 메인 강사인 식품안전팀 곽정혁 본인, `파트너:`는 보조 진행자입니다. 괄호 없이 `진행자:`와 `파트너:`만 표기) 특히 `slide_idx: 0`번(첫 번째 슬라이드)의 첫 문장은 반드시 `진행자: {MANDATORY_OPENING_LINE}` 로 시작해야 합니다! 한 슬라이드 안에서 진행자와 파트너가 4~6번 이상 자연스럽게 질문·공감·예시 설명을 주고받으며 진짜 사람끼리 대화하는 느낌을 극대화하십시오. (발화자 이름 글자 수는 제외한 순수 대사 분량이 목표 글자 수를 넘어야 합니다.)"
         if dialogue_mode else
-        "1인 전문 위생교육 강사가 현장에서 친근하게 풀어서 이야기하는 구어체 형식을 유지하십시오."
+        f"1인 남성 전문 위생교육 강사(식품안전팀 곽정혁)가 현장에서 친근하게 풀어서 이야기하는 구어체 형식을 유지하되, `slide_idx: 0`번(첫 번째 슬라이드)의 첫 문장은 반드시 `{MANDATORY_OPENING_LINE}` 로 시작하십시오."
     )
 
     def _expand_batch(batch_items):
@@ -1573,11 +1928,12 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
         이번 '{edu_month_str} 정기 위생교육 ({topic})' 영상이 법정 교육 시간 기준인 총 {target_minutes}분 분량을 정상 말속도로 자연스럽게 채울 수 있도록, 아래 슬라이드들의 대본("script")을 심층 확장하십시오.
 
         [절대 준수 규칙]:
-        1. 팩트 엄수 (추정·창작 금지): 슬라이드 카드·표·기존 대본 및 참고 원문에 명시된 기준과 수치만 사용하십시오. 원문에 없는 과태료, 법조항 번호, 온도 수치를 절대 지어내지 마십시오.
-        2. 고정 슬라이드 보존:
-           - 'INTRO_1TOP_3BOT'(당부말씀)는 생산본부장, 유제품생산부문장, 상온제품생산부문장, 품질안전부문장 4분의 핵심 당부 말씀을 모두 빠짐없이 소개하고 현장 실천 다짐을 나누십시오.
-           - 'OUTRO_EVENT'(이벤트 안내)는 기존 대본의 당첨 순번 숫자와 경품 금액 문구를 100% 동일하게 유지하면서 이번 달 핵심 요약 인사를 덧붙이십시오.
-        3. 화법 및 구성: {mode_guide}
+1. 팩트 엄수 (추정·창작 금지): 슬라이드 카드·표·기존 대본 및 참고 원문에 명시된 기준과 수치만 사용하십시오. 원문에 없는 과태료, 법조항 번호, 온도 수치를 절대 지어내지 마십시오.
+2. 고정 슬라이드 보존:
+  - `slide_idx: 0`이 포함되어 있다면 대본 맨 첫 문장을 반드시 '{'진행자: ' if dialogue_mode else ''}{MANDATORY_OPENING_LINE}' 로 시작하십시오.
+  - 'INTRO_1TOP_3BOT'(당부말씀)는 생산본부장, 유제품생산부문장, 상온제품생산부문장, 품질안전부문장 4분의 핵심 당부 말씀을 모두 빠짐없이 소개하고 현장 실천 다짐을 나누십시오.
+  - 'OUTRO_EVENT'(이벤트 안내)는 기존 대본의 당첨 순번 숫자와 경품 금액 문구를 100% 동일하게 유지하면서 이번 달 핵심 요약 인사를 덧붙이십시오.
+3. 화법 및 구성: {mode_guide}
            같은 문장을 반복하지 말고 ① 이 기준이 왜 식품 안전에 중요한지 배경 설명 → ② 작업 전·중·후 현장에서 눈으로 확인하는 구체적 실천 요령 → ③ 놓치기 쉬운 실수 예방 팁 순서로 풀어내어 각 슬라이드의 [필수 목표 순수 대사 글자 수]를 반드시 달성하십시오.
 
         [참고 원문 발췌]:
@@ -1632,7 +1988,11 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
 def main():
     st.markdown(custom_theme_css, unsafe_allow_html=True)
 
-    for key in ["slides_data", "pre_calc_log", "final_video_bytes", "final_pptx_bytes", "custom_font_paths", "leader_photos", "intro_full_slide_bytes"]:
+    for key in [
+        "slides_data", "pre_calc_log", "final_video_bytes", "final_pptx_bytes",
+        "custom_font_paths", "leader_photos", "intro_full_slide_bytes",
+        "intro_extracted_raw_text", "last_intro_file_sig"
+    ]:
         if key not in st.session_state:
             if key == "custom_font_paths":
                 st.session_state[key] = {}
@@ -1641,8 +2001,8 @@ def main():
             else:
                 st.session_state[key] = None
 
-    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(NotebookLM 대화형 성우 · 10~15분 맞춤 · 3D 도면 통합판)</span></h1>", unsafe_allow_html=True)
-    st.markdown("유료 Gemini API 단일 연결로 **NotebookLM 스타일 2인 남녀 대화형 더빙**, **10~15분 법정 교육 시간 맞춤 대본**, **슬라이드별 3D 위생 도면**까지 원클릭으로 제작합니다.")
+    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(남성 진행 고정 · 잘림 0% Auto-Fit · 10~15분 통합판)</span></h1>", unsafe_allow_html=True)
+    st.markdown(f"유료 Gemini API 단일 연결로 **`{MANDATORY_OPENING_LINE}` 남성 오프닝 고정**, **문장 잘림 없는 Auto-Fit 슬라이드**, **10~15분 법정 교육 시간 맞춤 대본**을 원클릭으로 제작합니다.")
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # --- 좌측 사이드바 ---
@@ -1652,61 +2012,60 @@ def main():
         st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·심층대본:** `{PLANNING_MODEL}`\n• **3D 맞춤 도면:** `{VISUAL_OMNI_MODEL}`")
 
         st.markdown("---")
-        st.header("🎙️ 성우 목소리 & 대화 모드 설정")
+        st.header("🎙️ 남성 진행 성우 & 대화 모드 설정")
         tts_engine = st.radio(
             "음성 합성 엔진 선택",
             [
-                "Gemini Native TTS (NotebookLM 동일 계열 · 초자연 대화형)",
-                "Edge Neural TTS (보조 신경망 성우 6종)",
-                "OpenAI TTS (ChatGPT 성우)"
+                "Gemini Native TTS (NotebookLM 동일 계열 · 남성 메인 진행)",
+                "Edge Neural TTS (보조 남성 신경망 성우)",
+                "OpenAI TTS (ChatGPT 남성 성우)"
             ],
             index=0
         )
 
-        gemini_voice = "Kore"
-        gemini_partner_voice = "Puck"
+        gemini_voice = "Puck"
+        gemini_partner_voice = "Kore"
         gemini_dialogue = True
         openai_model = "gpt-4o-mini-tts"
-        openai_voice = "nova"
-        edge_voice = "ko-KR-SunHiNeural"
+        openai_voice = "echo"
+        edge_voice = "ko-KR-InJoonNeural"
         edge_pitch = "+0Hz"
         openai_key_input = DEFAULT_OPENAI_KEY
 
         if "Gemini" in tts_engine:
             gemini_voice_map = {
-                "🎙️ NotebookLM 2인 남녀 티키타카 (Kore 여성 + Puck 남성 - 강력 추천)": ("Kore", "Puck", True, "ko-KR-SunHiNeural"),
-                "🎙️ NotebookLM 2인 차분한 대담 (Aoede 여성 + Charon 중저음 남성)": ("Aoede", "Charon", True, "ko-KR-SunHiNeural"),
-                "Kore 단독 (지적이고 또렷한 대표 여성 강사)": ("Kore", "Puck", False, "ko-KR-SunHiNeural"),
-                "Aoede 단독 (부드럽고 친근한 대화형 여성 강사)": ("Aoede", "Puck", False, "ko-KR-SunHiNeural"),
-                "Puck 단독 (생동감 넘치고 활기찬 남성 강사)": ("Puck", "Kore", False, "ko-KR-InJoonNeural"),
-                "Charon 단독 (신뢰감 있는 중저음 남성 강사)": ("Charon", "Kore", False, "ko-KR-HyunsuMultilingualNeural"),
-                "Fenrir 단독 (힘 있고 명확한 현장 브리핑 남성)": ("Fenrir", "Kore", False, "ko-KR-InJoonNeural")
+                "🎙️ NotebookLM 2인 대담 (곽정혁 남성 진행 Puck + 여성 파트너 Kore - 추천)": ("Puck", "Kore", True, "ko-KR-InJoonNeural"),
+                "🎙️ NotebookLM 2인 중저음 대담 (곽정혁 중저음 남성 Charon + 여성 파트너 Aoede)": ("Charon", "Aoede", True, "ko-KR-HyunsuMultilingualNeural"),
+                "🎙️ NotebookLM 2인 남성 듀오 대담 (남성 진행 Puck + 남성 파트너 Charon)": ("Puck", "Charon", True, "ko-KR-InJoonNeural"),
+                "Puck 단독 (생동감 넘치고 활기찬 남성 강사 - 단독 추천)": ("Puck", "Kore", False, "ko-KR-InJoonNeural"),
+                "Charon 단독 (신뢰감 있고 차분한 중저음 남성 강사)": ("Charon", "Kore", False, "ko-KR-HyunsuMultilingualNeural"),
+                "Fenrir 단독 (힘 있고 명확한 현장 브리핑 남성 강사)": ("Fenrir", "Kore", False, "ko-KR-InJoonNeural"),
+                "Orus 단독 (단정하고 안정감 있는 남성 아나운서톤)": ("Orus", "Kore", False, "ko-KR-InJoonNeural")
             }
-            chosen_g_label = st.selectbox("NotebookLM / Gemini 보이스 선택", list(gemini_voice_map.keys()), index=0)
+            chosen_g_label = st.selectbox("NotebookLM / Gemini 남성 중심 보이스 선택", list(gemini_voice_map.keys()), index=0)
             gemini_voice, gemini_partner_voice, gemini_dialogue, edge_voice = gemini_voice_map[chosen_g_label]
         elif "OpenAI" in tts_engine:
             openai_key_input = st.text_input("OpenAI API Key", value=DEFAULT_OPENAI_KEY, type="password").strip().strip('"').strip("'")
             gemini_dialogue = False
             openai_model = st.selectbox("OpenAI 음성 모델", ["gpt-4o-mini-tts", "tts-1-hd"], index=0)
             openai_voice_map = {
-                "nova (밝고 활기찬 여성 강사)": ("nova", "ko-KR-SunHiNeural", "+0Hz"),
-                "shimmer (차분하고 신뢰감 있는 여성)": ("shimmer", "ko-KR-SunHiNeural", "-5Hz"),
-                "echo (친근하고 부드러운 남성 강사)": ("echo", "ko-KR-InJoonNeural", "+0Hz"),
-                "onyx (무게감 있는 중저음 남성)": ("onyx", "ko-KR-HyunsuMultilingualNeural", "-3Hz")
+                "echo (친근하고 부드러운 남성 강사 - 기본)": ("echo", "ko-KR-InJoonNeural", "+0Hz"),
+                "onyx (무게감 있는 중저음 남성 강사)": ("onyx", "ko-KR-HyunsuMultilingualNeural", "-3Hz"),
+                "ash (생동감 넘치는 경쾌한 남성 강사)": ("ash", "ko-KR-InJoonNeural", "+5Hz"),
+                "verse (차분하고 또렷한 남성 내레이션)": ("verse", "ko-KR-InJoonNeural", "+0Hz")
             }
-            chosen_v_label = st.selectbox("ChatGPT 보이스 선택", list(openai_voice_map.keys()), index=0)
+            chosen_v_label = st.selectbox("ChatGPT 남성 보이스 선택", list(openai_voice_map.keys()), index=0)
             openai_voice, edge_voice, edge_pitch = openai_voice_map[chosen_v_label]
         else:
             gemini_dialogue = False
             edge_voice_map = {
-                "선희 (밝고 또렷한 여성 아나운서)": ("ko-KR-SunHiNeural", "+0Hz"),
-                "인준 (자연스러운 남성 아나운서)": ("ko-KR-InJoonNeural", "+0Hz"),
+                "인준 (자연스럽고 또렷한 남성 아나운서 - 기본)": ("ko-KR-InJoonNeural", "+0Hz"),
                 "현수 (중후하고 차분한 남성 강사)": ("ko-KR-HyunsuMultilingualNeural", "+0Hz"),
-                "선희 소프트 (차분하고 부드러운 여성 내레이션)": ("ko-KR-SunHiNeural", "-5Hz"),
                 "인준 브라이트 (활기차고 경쾌한 남성 진행자)": ("ko-KR-InJoonNeural", "+5Hz"),
-                "현수 딥톤 (신뢰감 있는 중저음 남성 브리핑)": ("ko-KR-HyunsuMultilingualNeural", "-4Hz")
+                "현수 딥톤 (신뢰감 있는 중저음 남성 브리핑)": ("ko-KR-HyunsuMultilingualNeural", "-4Hz"),
+                "인준 차분톤 (안정감 있는 남성 현장 강사)": ("ko-KR-InJoonNeural", "-4Hz")
             }
-            chosen_e_label = st.selectbox("신경망 성우 선택 (6종)", list(edge_voice_map.keys()), index=0)
+            chosen_e_label = st.selectbox("남성 신경망 성우 선택", list(edge_voice_map.keys()), index=0)
             edge_voice, edge_pitch = edge_voice_map[chosen_e_label]
 
         voice_speed = st.slider("말하기 속도 배율 (자연스러운 정속 1.00 권장)", min_value=0.92, max_value=1.16, value=1.00, step=0.02)
@@ -1725,14 +2084,14 @@ def main():
             "speed": voice_speed
         }
 
-        if st.button("🔊 선택한 목소리 / 2인 대화 샘플 미리듣기", use_container_width=True):
+        if st.button("🔊 선택한 남성 진행 / 2인 대화 오프닝 미리듣기", use_container_width=True):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_aud:
                 sample_path = tmp_aud.name
             sample_txt = (
-                "진행자: 안녕하세요 연세유업 아산공장 여러분! 오늘 위생교육도 귀에 쏙쏙 들어오게 같이 이야기 나눠볼까요?\n"
-                "파트너: 네, 반갑습니다! 현장에서 바로 써먹을 수 있는 핵심 포인트만 알기 쉽게 짚어드리겠습니다!"
+                f"진행자: {MANDATORY_OPENING_LINE} 오늘 정기 위생교육도 현장에서 꼭 필요한 핵심만 귀에 쏙쏙 들어오게 함께 살펴보겠습니다.\n"
+                "파트너: 네, 안녕하세요! 작업 현장에서 바로 실천할 수 있는 위생 수칙들을 알기 쉽게 짚어드리겠습니다!"
                 if gemini_dialogue else
-                "안녕하세요! 연세유업 아산공장 임직원 여러분, 이번 달 정기 위생교육을 활기차게 시작해 보겠습니다."
+                f"{MANDATORY_OPENING_LINE} 연세유업 아산공장 임직원 여러분, 이번 달 정기 위생교육을 활기차게 시작해 보겠습니다."
             )
             with st.spinner("실제 성우 오디오 샘플을 합성하고 있습니다..."):
                 _, tts_meta = create_natural_tts_audio(sample_txt, sample_path, tts_config, return_meta=True)
@@ -1849,12 +2208,12 @@ def main():
         st.markdown("---")
 
         # --- Step 2: 당부 말씀 ---
-        st.markdown("### 👔 Step 2. 오프닝: 월간 위생교육 전 당부말씀 (상단 생산본부장 + 하단 3부문장 & 깃허브 고정 사진 연동)")
+        st.markdown("### 👔 Step 2. 오프닝: 월간 위생교육 전 당부말씀 (Auto-Fit 글씨 자동 조절 & PDF 원본 그대로 사용 지원)")
         intro_mode = st.radio(
             "당부 말씀 적용 방식:",
             [
-                "PPTX 업로드 또는 텍스트 입력 (부문장님 얼굴 사진 깃허브 고정 + 상단1·하단3 표준 레이아웃 렌더링)",
-                "당부 말씀 슬라이드 완성본 이미지/PDF 통째로 올리기 (원본 슬라이드 그림 100% 그대로 사용)",
+                "PPTX 업로드 또는 텍스트 입력 (부문장님 얼굴 사진 깃허브 고정 + 글자 잘림 없는 Auto-Fit 표준 레이아웃)",
+                "당부 말씀 슬라이드 완성본 이미지/PDF 통째로 올리기 (원본 슬라이드 그림 100% 그대로 표시 + PDF 텍스트 자동 대본 연동)",
                 "당부 말씀 슬라이드 생략"
             ]
         )
@@ -1867,11 +2226,11 @@ def main():
             if not st.session_state.get("leader_photos"):
                 st.session_state["leader_photos"] = load_default_leader_photos_from_repo()
 
-            leader_pptx = st.file_uploader("📄 '위생교육 전 말씀.pptx' 업로드 (4분 말씀 텍스트만 자동 추출 / 사진은 깃허브 고정 사진 유지):", type=["pptx"], key="ldr_pptx")
+            leader_pptx = st.file_uploader("📄 '위생교육 전 말씀.pptx' 업로드 (4분 말씀 텍스트만 자동 추출 / 길어도 글씨 크기 자동 맞춤):", type=["pptx"], key="ldr_pptx")
             parsed_leaders = {}
             if leader_pptx:
                 parsed_leaders = parse_leader_pptx_text_only(leader_pptx)
-                st.success("PPTX에서 4분의 당부 말씀 텍스트만 깔끔하게 추출했습니다! (프로필 사진은 깃허브 원본 고정)")
+                st.success("PPTX에서 4분의 당부 말씀 텍스트를 추출했습니다! (말씀이 길어도 카드 크기에 맞춰 글씨가 자동 축소됩니다)")
 
             default_prod = parsed_leaders.get("생산본부") or "일교차가 커지면서 외부 해충이나 이물질이 따뜻한 실내 작업장으로 유입되기 쉬워 각별한 주의가 필요한 시기입니다. 우리 연세유업 아산공장의 흔들림 없는 식품 안전은 결국 현장에 계신 여러분의 빈틈없는 이물 관리와 밀폐 수칙 준수에서 시작됩니다. 현장에 정착된 철저한 HACCP 실행력을 바탕으로 위해요소를 사전에 100% 차단하는 든든한 방어선 역할을 해 주시길 당부 드립니다."
             default_dairy = parsed_leaders.get("유제품생산부문") or "유제품은 미생물과 주변 환경변화에 매우 민감한 특성을 가지고 있습니다. 공장 천정, 덕트, 배관 표면 등에 결로가 발생하면 곰팡이 증식 조건이 되므로 작업장 환경 청소와 철저한 건조 관리에 많은 관심이 필요합니다. 일일 건강 모니터링도 철저히 실천해 주시기 바랍니다."
@@ -1915,15 +2274,26 @@ def main():
                 intro_slide_file = st.file_uploader("당부 말씀 슬라이드 이미지(PNG/JPG) 또는 1페이지 PDF 업로드:", type=["png", "jpg", "jpeg", "pdf"], key="intro_raw_slide")
                 if intro_slide_file:
                     ext_i = os.path.splitext(intro_slide_file.name)[1].lower()
+                    file_sig = f"{intro_slide_file.name}_{intro_slide_file.size}"
                     if ext_i == ".pdf" and PYMUPDF_AVAILABLE:
                         p_list = extract_pages_from_pdf(intro_slide_file.getvalue())
                         if p_list:
                             st.session_state["intro_full_slide_bytes"] = p_list[0]["image_bytes"]
-                            intro_custom_text = p_list[0]["text"]
+                            if st.session_state.get("last_intro_file_sig") != file_sig:
+                                st.session_state["intro_extracted_raw_text"] = p_list[0]["text"]
+                                st.session_state["last_intro_file_sig"] = file_sig
+                            st.success("PDF 슬라이드 화면을 100% 원본 그대로 고정했으며, 내부 말씀 텍스트를 우측 대본창에 자동 추출했습니다!")
                     else:
                         st.session_state["intro_full_slide_bytes"] = intro_slide_file.getvalue()
+                        st.session_state["last_intro_file_sig"] = file_sig
+                        st.success("업로드하신 당부 말씀 이미지를 100% 원본 그대로 사용합니다.")
             with col_fs2:
-                intro_custom_text = st.text_area("성우가 읽을 당부 말씀 요약/원문 입력:", value=intro_custom_text or "생산본부장님 및 유제품, 상온, 품질안전 각 부문장님께서 철저한 이물 관리와 기본 위생 수칙 준수를 당부하셨습니다.", height=120)
+                default_raw_intro = st.session_state.get("intro_extracted_raw_text") or "생산본부장님 및 유제품, 상온, 품질안전 각 부문장님께서 철저한 이물 관리와 기본 위생 수칙 준수를 당부하셨습니다."
+                intro_custom_text = st.text_area(
+                    "성우가 읽을 당부 말씀 원문 (PDF 업로드 시 자동 채움):",
+                    value=default_raw_intro,
+                    height=145
+                )
 
         st.markdown("---")
 
@@ -1946,8 +2316,8 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        mode_btn_label = "NotebookLM 2인 대화형" if gemini_dialogue else "전문 강사 구어체"
-        if st.button(f"🚀 목표 {target_video_mins}분 맞춤 [{mode_btn_label}] 대본 & 3D 슬라이드 일괄 생성 시작", type="primary", use_container_width=True):
+        mode_btn_label = "NotebookLM 2인 대화형(남성진행)" if gemini_dialogue else "남성 전문강사 구어체"
+        if st.button(f"🚀 목표 {target_video_mins}분 맞춤 [{mode_btn_label}] 대본 & Auto-Fit 3D 슬라이드 일괄 생성 시작", type="primary", use_container_width=True):
             if not GEMINI_API_KEY:
                 st.error("Streamlit Secrets에 GOOGLE_API_KEY 또는 GEMINI_API_KEY를 설정해주세요.")
             elif "표준 모드" in workflow_mode:
@@ -2011,6 +2381,7 @@ def main():
                             extra_source_text=f"{intro_custom_text}\n\n{combined_text}",
                             dialogue_mode=gemini_dialogue
                         )
+                        slides = enforce_opening_greeting(slides, dialogue_mode=gemini_dialogue)
 
                         local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
 
@@ -2046,18 +2417,34 @@ def main():
                     st.error("requirements.txt에 PyMuPDF를 추가해주세요.")
                 else:
                     with st.spinner(f"PDF 고해상도 추출 및 목표 {target_video_mins}분 [{mode_btn_label}] 대본 생성 중..."):
+                        has_intro_flag = (intro_mode != "당부 말씀 슬라이드 생략")
                         pages_info = extract_pages_from_pdf(existing_pdf_file.getvalue())
-                        scripts_list = generate_scripts_for_existing_pdf(pages_info, edu_month_str, topic, dialogue_mode=gemini_dialogue)
+                        scripts_list = generate_scripts_for_existing_pdf(
+                            pages_info,
+                            edu_month_str,
+                            topic,
+                            dialogue_mode=gemini_dialogue,
+                            has_intro_before=has_intro_flag
+                        )
                         built_slides = []
 
-                        if intro_mode != "당부 말씀 슬라이드 생략":
-                            intro_sc = (
-                                f"진행자: 안녕하세요 연세유업 아산공장 임직원 여러분! {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 짚어보겠습니다. 먼저 생산본부장님께서는 {ldr_prod}\n"
-                                f"파트너: 네, 이어서 유제품생산부문장님께서는 {ldr_dairy} 그리고 상온제품생산부문장님께서는 {ldr_ambient}\n"
-                                f"진행자: 끝으로 품질안전부문장님께서는 {ldr_qc} 라고 강조해 주셨습니다. 현장에서 꼭 함께 실천해 주시길 바랍니다!"
-                                if gemini_dialogue else
-                                f"안녕하세요, 연세유업 아산공장 임직원 여러분! {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
-                            )
+                        if has_intro_flag:
+                            if "통째로" in intro_mode:
+                                intro_sc = (
+                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 살펴보겠습니다. {intro_custom_text}\n"
+                                    f"파트너: 네, 현장에서 꼭 마음에 새기고 실천해야 할 핵심 당부 말씀이네요! 그럼 본격적인 교육을 시작해 볼까요?"
+                                    if gemini_dialogue else
+                                    f"{MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {intro_custom_text}"
+                                )
+                            else:
+                                intro_sc = (
+                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 짚어보겠습니다. 먼저 생산본부장님께서는 {ldr_prod}\n"
+                                    f"파트너: 네, 이어서 유제품생산부문장님께서는 {ldr_dairy} 그리고 상온제품생산부문장님께서는 {ldr_ambient}\n"
+                                    f"진행자: 끝으로 품질안전부문장님께서는 {ldr_qc} 라고 강조해 주셨습니다. 현장에서 꼭 함께 실천해 주시길 바랍니다!"
+                                    if gemini_dialogue else
+                                    f"{MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
+                                )
+
                             intro_slide_obj = {
                                 "layout": "INTRO_1TOP_3BOT",
                                 "type": "INTRO",
@@ -2099,6 +2486,7 @@ def main():
                             extra_source_text=f"{intro_custom_text}\n\n{pdf_full_txt}",
                             dialogue_mode=gemini_dialogue
                         )
+                        built_slides = enforce_opening_greeting(built_slides, dialogue_mode=gemini_dialogue)
 
                         pure_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in built_slides)
                         est_min_done = (pure_chars / (420.0 * voice_speed)) + (len(built_slides) * 0.6 / 60.0)
@@ -2123,7 +2511,7 @@ def main():
             st.info(
                 f"⏱️ **현재 대본 분량 진단:** 총 **{total_s}장** | 순수 대사 **{pure_total_chars:,}자** "
                 f"➡️ 현재 속도(`{voice_speed:.2f}x`) 기준 **예상 영상 길이: 약 {est_mm}분 {est_ss:02d}초** "
-                f"({'NotebookLM 2인 대화 모드' if gemini_dialogue else '1인 강사 모드'})"
+                f"({'NotebookLM 2인 대화 모드(남성진행)' if gemini_dialogue else '1인 남성 강사 모드'})"
             )
 
             updated_slides = []
@@ -2138,13 +2526,21 @@ def main():
                         with col_p2:
                             new_title = st.text_input("슬라이드 제목", value=slide.get("title", ""), key=f"t_{idx}")
                             new_script = st.text_area(
-                                "성우 대본 (`진행자:` / `파트너:` 태그 유지 시 2인 대화 합성)",
+                                "성우 대본 (`진행자:`=남성 곽정혁 / `파트너:`=보조 진행자)",
                                 value=slide.get("script", ""),
                                 height=195,
                                 key=f"s_{idx}"
                             )
                             slide["title"] = new_title
                             slide["script"] = new_script
+
+                            if slide.get("layout") not in ("INTRO_1TOP_3BOT", "INTRO_4GRID", "OUTRO_EVENT", "CUSTOM_PDF_PAGE", "COVER"):
+                                new_bsum = st.text_input(
+                                    "하단 핵심 원칙 배너 문구 (길어도 글씨 크기 자동 조절됨)",
+                                    value=slide.get("bottom_summary", ""),
+                                    key=f"bs_{idx}"
+                                )
+                                slide["bottom_summary"] = new_bsum
 
                             if slide.get("layout") in ("SPLIT_VISUAL", "COVER", "CARDS_3COL"):
                                 new_v_prompt = st.text_input(
@@ -2181,7 +2577,7 @@ def main():
                         with col_p1:
                             preview_img_path = os.path.join(preview_dir, f"preview_{idx}.png")
                             create_slide_image_hd(slide, idx, total_s, preview_img_path, font_config, theme_mode, leader_photos=st.session_state["leader_photos"])
-                            st.image(preview_img_path, caption=f"슬라이드 {idx + 1} (1920x1080 고해상도 렌더링)", use_container_width=True)
+                            st.image(preview_img_path, caption=f"슬라이드 {idx + 1} (1920x1080 고해상도 Auto-Fit 렌더링)", use_container_width=True)
 
                         updated_slides.append(slide)
 
@@ -2199,7 +2595,7 @@ def main():
 
             col_b1, col_b2 = st.columns(2)
             with col_b1:
-                if st.button("📊 1단계: 고해상도 이미지 슬라이드 PPTX 생성 (깨짐 0%)", use_container_width=True):
+                if st.button("📊 1단계: 고해상도 이미지 슬라이드 PPTX 생성 (깨짐·잘림 0%)", use_container_width=True):
                     with st.spinner("1920x1080 고해상도 슬라이드 이미지 기반 PPTX 파일을 생성하고 있습니다..."):
                         st.session_state["final_pptx_bytes"] = generate_highres_image_pptx(
                             slides_to_render,
@@ -2219,7 +2615,7 @@ def main():
                     )
 
             with col_b2:
-                if st.button("🎥 2단계: NotebookLM 대화형 성우 + Full-HD MP4 영상 렌더링", type="primary", use_container_width=True):
+                if st.button("🎥 2단계: 남성 진행 성우 더빙 + Full-HD MP4 영상 렌더링", type="primary", use_container_width=True):
                     t_start = time.time()
                     with tempfile.TemporaryDirectory() as temp_dir:
                         total_cnt = len(slides_to_render)
