@@ -90,7 +90,10 @@ DEFAULT_OPENAI_KEY = (
 def get_genai_client(api_key):
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta")
+    )
 
 def get_ffmpeg_binary():
     ffmpeg_bin = shutil.which("ffmpeg")
