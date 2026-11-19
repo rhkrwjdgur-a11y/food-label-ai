@@ -7,12 +7,14 @@ import tempfile
 import asyncio
 import base64
 import socket
+import shutil
 import requests
 import time
 import json
 import math
 import os
 import io
+import wave
 import re
 import datetime
 from gtts import gTTS
@@ -45,7 +47,7 @@ except ImportError:
 st.set_page_config(page_title="연세유업 AI 위생교육 스튜디오", layout="wide")
 socket.setdefaulttimeout(600)
 
-# 고정 AI 모델 상수
+# 고정 AI 모델 상수 (유료 Gemini Developer API 직결)
 PLANNING_MODEL = "gemini-3.8-flash"
 VISUAL_OMNI_MODEL = "gemini-3.1-flash-image"
 
@@ -69,7 +71,7 @@ def check_password():
         return True
 
 # ==========================================
-# [3] API 키 로드 및 Vertex AI(AQ.) / 표준(AIza) 자동 호환 클라이언트
+# [3] API 키 로드 (유료 Gemini Developer API 직결)
 # ==========================================
 GEMINI_API_KEY = (
     st.secrets.get("GEMINI_API_KEY")
@@ -89,6 +91,16 @@ def get_genai_client(api_key):
     if not api_key:
         return None
     return genai.Client(api_key=api_key)
+
+def get_ffmpeg_binary():
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        return ffmpeg_bin
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        raise RuntimeError(f"ffmpeg 실행 파일을 찾을 수 없습니다: {e}")
 
 # ==========================================
 # [4] 커스텀 CSS
@@ -154,7 +166,7 @@ custom_theme_css = """
 """
 
 # ==========================================
-# [5] 깃허브 font/ 폴더 자동 스캔 및 한글 폰트 로더
+# [5] 깃허브 font/ 폴더 자동 스캔 및 한글 폰트 로더 (특수기호 깨짐 방어 포함)
 # ==========================================
 FONT_SEARCH_DIRS = ["font", "fonts", "폰트", "."]
 
@@ -182,11 +194,6 @@ FONT_SEARCH_MAP = {
 }
 
 def find_font_file(font_choice, is_bold=False, custom_font_paths=None):
-    """
-    1순위: 사이드바 임시 업로드 폰트
-    2순위: 깃허브 저장소 내 font/ , fonts/ , 폰트/ , 루트(.) 폴더 자동 스캔
-    3순위: 로컬 Windows 폰트 폴더 또는 리눅스 서버 나눔고딕(fonts-nanum) 안전 폴백
-    """
     if custom_font_paths and custom_font_paths.get(font_choice):
         cp = custom_font_paths[font_choice]
         if os.path.exists(cp):
@@ -256,7 +263,14 @@ def load_pil_font(font_choice, size, is_bold=False, custom_font_paths=None):
 def wrap_text_by_pixel(text, font, max_width, draw):
     if not text:
         return []
-    cleaned_text = str(text).replace("•", "-").replace("▸", "-").replace("▪", "-")
+    cleaned_text = (
+        str(text)
+        .replace("•", "-")
+        .replace("▸", "-")
+        .replace("▪", "-")
+        .replace("☑", "[V]")
+        .replace("□", "[ ]")
+    )
     lines = []
     for paragraph in cleaned_text.split('\n'):
         paragraph = paragraph.strip()
@@ -290,10 +304,6 @@ def wrap_text_by_pixel(text, font, max_width, draw):
 # [6] 문서/동영상 인라인 변환 및 리더 프로필 사진 유틸리티
 # ==========================================
 def load_default_leader_photos_from_repo():
-    """
-    깃허브 저장소 내 모든 폴더(루트 및 하위 폴더 전체)를 스캔하여
-    4분 리더의 프로필 사진을 고정 로드합니다.
-    """
     photos = {}
     role_map = {
         "생산본부": ["생산본부장", "생산본부", "본부장", "공장장", "leader1", "1_"],
@@ -318,7 +328,6 @@ def load_default_leader_photos_from_repo():
     return photos
 
 def extract_text_and_Media_from_pptx(file_obj):
-    """참고용 본론 PPTX에서 슬라이드 텍스트와 삽입된 이미지들을 추출합니다."""
     file_bytes = file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read()
     prs = Presentation(io.BytesIO(file_bytes))
     full_text = []
@@ -353,10 +362,6 @@ def extract_text_and_Media_from_pptx(file_obj):
     return "\n\n".join(full_text), extracted_images
 
 def parse_leader_pptx_text_only(file_obj):
-    """
-    '위생교육 전 말씀.pptx' 파일에서 이미지는 절대 건드리지 않고,
-    오직 4분의 당부 말씀 텍스트만 추출합니다. (깃허브 고정 사진 100% 보호)
-    """
     raw_text, _ = extract_text_and_Media_from_pptx(file_obj)
     texts = {
         "생산본부": "",
@@ -403,24 +408,12 @@ def extract_pages_from_pdf(pdf_bytes):
     return pages_info
 
 def build_inline_video_part(video_path):
-    """
-    시스템 PATH에 ffmpeg가 없더라도 moviepy 내장 imageio_ffmpeg 실행 파일을 자동 연결하여
-    15MB 초과 영상을 경량 변환 후 Part.from_bytes로 전달합니다.
-    """
-    import shutil
     raw_size = os.path.getsize(video_path)
     if raw_size <= 15 * 1024 * 1024:
         with open(video_path, "rb") as rf:
             return types.Part.from_bytes(data=rf.read(), mime_type="video/mp4")
 
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if not ffmpeg_bin:
-        try:
-            import imageio_ffmpeg
-            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception as e:
-            raise RuntimeError(f"내장 ffmpeg 실행 파일을 찾을 수 없습니다: {e}")
-
+    ffmpeg_bin = get_ffmpeg_binary()
     compressed_mp4 = video_path + "_slim.mp4"
     compressed_mp3 = video_path + "_slim.mp3"
     try:
@@ -464,13 +457,9 @@ def build_inline_video_part(video_path):
     raise RuntimeError("동영상 용량이 너무 커서 인라인 변환에 실패했습니다.")
 
 # ==========================================
-# [7] 슬라이드 내용 맞춤형 시각 도면 생성 엔진 (gemini-omni-1.2-flash 직결)
+# [7] 슬라이드 내용 맞춤형 시각 도면 생성 엔진 (gemini-3.1-flash-image 직결)
 # ==========================================
 def build_tailored_visual_prompt(slide_obj, fallback_topic=""):
-    """
-    슬라이드의 제목과 우측 카드(cards) 소제목·본문 핵심 키워드를 결합하여,
-    해당 슬라이드 내용에 100% 부합하는 구체적인 시각 도면 프롬프트를 조립합니다.
-    """
     base_vp = str(slide_obj.get("visual_prompt", "")).strip()
     s_title = str(slide_obj.get("title", fallback_topic)).strip()
     cards = slide_obj.get("cards", [])
@@ -489,10 +478,6 @@ def build_tailored_visual_prompt(slide_obj, fallback_topic=""):
     )
 
 def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=None):
-    """
-    네트워크 제한 등으로 외부 이미지 생성이 응답하지 않을 때에도,
-    해당 슬라이드의 우측 카드 핵심 키워드들을 직접 도식화하여 맞춤형 기술 다이어그램을 그립니다.
-    """
     w, h = 840, 760
     is_light = "10월" in theme_mode
     bg_col = (238, 244, 252) if is_light else (13, 25, 43)
@@ -547,11 +532,11 @@ def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=Non
         title_line = f"{h_str}  [{m_str}]" if m_str else h_str
         draw.text((nx1 + 138, ny1 + 24), title_line[:28], font=f_node, fill=sub_accent if is_light else (52, 211, 153))
 
-        raw_b = str(item.get("body", "")).replace("•", "").strip()
+        raw_b = str(item.get("body", "")).replace("•", "-").strip()
         b_lines = wrap_text_by_pixel(raw_b, f_desc, (nx2 - nx1) - 165, draw)
         by_cur = ny1 + 68
         for bl in b_lines[:2]:
-            draw.text((nx1 + 138, by_cur), f"▸ {bl}", font=f_desc, fill=ink)
+            draw.text((nx1 + 138, by_cur), f"- {bl}", font=f_desc, fill=ink)
             by_cur += 34
 
         if idx_n < n_cnt - 1:
@@ -568,11 +553,6 @@ def generate_procedural_infographic(slide_obj, theme_mode, custom_font_paths=Non
     return buf.getvalue()
 
 def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key="", gemini_key="", custom_font_paths=None):
-    """
-    1순위: google-genai 클라이언트로 gemini-3.1-flash-image 등 정식 이미지 생성 모델 순차 호출
-    2순위: OpenAI 키 보유 시 DALL-E 3 보조 호출
-    3순위: 모든 외부 API 응답 실패 시에만 인포그래픽 다이어그램 작도
-    """
     tailored_prompt = build_tailored_visual_prompt(slide_obj, fallback_topic=fallback_topic)
     style_prefix = (
         "Generate a clean isometric 3D food factory hygiene & equipment technical illustration on a soft light architectural blueprint background, "
@@ -585,7 +565,7 @@ def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key=
     )
     full_prompt = style_prefix + tailored_prompt
 
-    # 1) Gemini 정식 이미지 생성 모델 순차 호출 (속도 제한 시 자동 재시도 포함)
+    # 1) 유료 Gemini 정식 이미지 생성 모델 순차 호출
     if gemini_key:
         client = get_genai_client(gemini_key)
         candidate_models = [
@@ -633,95 +613,195 @@ def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key=
         except Exception:
             pass
 
-    # 3) 슬라이드 카드 맞춤형 벡터 다이어그램 폴백
     return generate_procedural_infographic(slide_obj, theme_style, custom_font_paths=custom_font_paths)
 
 # ==========================================
-# [8] 초자연스러운 성우 음성 엔진 (OpenAI ChatGPT TTS + Edge Neural TTS 다중 보이스)
+# [8] 초자연 성우 엔진 (유료 Gemini Native TTS / NotebookLM 2인 대화 + OpenAI + Edge)
 # ==========================================
-def _split_script_chunks(text, max_chars=2800):
-    sentences = re.split(r'(?<=[.!?。])\s+|\n+', text.strip())
+def _split_script_chunks(text, max_chars=2600):
+    lines = re.split(r'\n+|(?<=[.!?。])\s+', text.strip())
     chunks, cur = [], ""
-    for s in sentences:
-        s = s.strip()
-        if not s:
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
-        if len(cur) + len(s) + 1 <= max_chars:
-            cur = f"{cur} {s}".strip() if cur else s
+        if len(cur) + len(line) + 1 <= max_chars:
+            cur = f"{cur}\n{line}".strip() if cur else line
         else:
             if cur:
                 chunks.append(cur)
-            cur = s
+            cur = line
     if cur:
         chunks.append(cur)
     return chunks if chunks else [text[:max_chars]]
 
+def _pcm_or_wav_to_mp3(raw_audio_bytes, mime_type, output_path, speed_rate=1.0):
+    """Gemini Native TTS가 반환하는 24kHz PCM 또는 WAV 오디오를 고음질 MP3로 변환합니다."""
+    tmp_wav = output_path + "_raw.wav"
+    try:
+        if (mime_type and "wav" in mime_type.lower()) or raw_audio_bytes[:4] == b"RIFF":
+            with open(tmp_wav, "wb") as wf:
+                wf.write(raw_audio_bytes)
+        else:
+            with wave.open(tmp_wav, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(raw_audio_bytes)
+
+        ffmpeg_bin = get_ffmpeg_binary()
+        cmd = [ffmpeg_bin, "-y", "-i", tmp_wav]
+        safe_spd = max(0.85, min(1.25, float(speed_rate)))
+        if abs(safe_spd - 1.0) >= 0.02:
+            cmd.extend(["-filter:a", f"atempo={safe_spd:.2f}"])
+        cmd.extend(["-acodec", "libmp3lame", "-q:a", "2", output_path])
+
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 300
+    finally:
+        if os.path.exists(tmp_wav):
+            try:
+                os.remove(tmp_wav)
+            except Exception:
+                pass
+
+def _auto_convert_to_two_speaker(script_text):
+    """단독 대본일지라도 2인 대화 모드가 켜져 있으면 자연스럽게 진행자/파트너 교대 구조로 태그를 입힙니다."""
+    if "진행자:" in script_text or "파트너:" in script_text:
+        return script_text
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', script_text.strip()) if s.strip()]
+    if len(sents) <= 1:
+        return f"진행자: {script_text}"
+    lines = []
+    for idx, s in enumerate(sents):
+        spk = "진행자" if idx % 2 == 0 else "파트너"
+        lines.append(f"{spk}: {s}")
+    return "\n".join(lines)
+
 def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=False):
     """
-    1순위: OpenAI TTS (gpt-4o-mini-tts 또는 tts-1-hd) - 긴 대본 청크 분할 및 파라미터 호환 방어
-    2순위: Microsoft Edge Neural TTS (남성/여성/중저음 6종 보이스 및 피치 완벽 분리)
-    3순위: gTTS 비상 폴백
+    1순위: 유료 Gemini Native TTS (NotebookLM 동일 계열 - 2인 남녀 대화 티키타카 & 단독 성우 완벽 지원)
+    2순위: OpenAI TTS
+    3순위: Microsoft Edge Neural TTS (6종 보이스)
     """
     clean_script = re.sub(r'[\*\#\[\]]', ' ', str(script_text)).strip()
     if not clean_script:
-        clean_script = "다음 화면의 핵심 위생 수칙을 함께 확인해 보겠습니다."
+        clean_script = "진행자: 다음 화면의 핵심 위생 수칙을 함께 확인해 보겠습니다."
 
-    engine = tts_config.get("engine", "Edge Neural TTS")
+    engine = tts_config.get("engine", "Gemini TTS")
+    gemini_key = tts_config.get("gemini_key", GEMINI_API_KEY).strip()
+    gemini_voice = tts_config.get("gemini_voice", "Kore")
+    gemini_partner_voice = tts_config.get("gemini_partner_voice", "Puck")
+    gemini_dialogue = tts_config.get("gemini_dialogue", True)
     openai_key = tts_config.get("openai_key", "").strip()
-    openai_voice = tts_config.get("openai_voice", "echo")
+    openai_voice = tts_config.get("openai_voice", "nova")
     openai_model = tts_config.get("openai_model", "gpt-4o-mini-tts")
-    edge_voice = tts_config.get("edge_voice", "ko-KR-InJoonNeural")
+    edge_voice = tts_config.get("edge_voice", "ko-KR-SunHiNeural")
     edge_pitch = tts_config.get("edge_pitch", "+0Hz")
-    speed_rate = float(tts_config.get("speed", 1.02))
-    openai_err_msg = ""
+    speed_rate = float(tts_config.get("speed", 1.00))
+    err_memo = ""
 
-    # 1) OpenAI TTS 호출
+    # 1) 유료 Gemini Native TTS (NotebookLM 동일 오디오 엔진)
+    if "Gemini" in engine and gemini_key:
+        client = get_genai_client(gemini_key)
+        tts_models = [
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-pro-preview-tts"
+        ]
+
+        if gemini_dialogue:
+            dialogue_script = _auto_convert_to_two_speaker(clean_script)
+            tts_input_text = (
+                "아래 대본을 실제 인기 라디오나 사내 팟캐스트에서 두 명의 진행자가 눈을 맞추며 유쾌하고 생동감 있게 대화하듯 자연스러운 한국어 구어체 호흡으로 읽어주세요:\n\n"
+                + dialogue_script
+            )
+            speech_cfg = types.SpeechConfig(
+                multi_speaker_voice_config=types.MultiSpeakerVoiceConfig(
+                    speaker_voice_configs=[
+                        types.SpeakerVoiceConfig(
+                            speaker="진행자",
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=gemini_voice)
+                            )
+                        ),
+                        types.SpeakerVoiceConfig(
+                            speaker="파트너",
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=gemini_partner_voice)
+                            )
+                        )
+                    ]
+                )
+            )
+        else:
+            solo_clean = clean_script.replace("진행자:", "").replace("파트너:", "").strip()
+            tts_input_text = (
+                "실제 사내 위생교육 전문 강사가 현장 임직원들과 친근하게 눈을 맞추며 이야기하듯 자연스러운 한국어 구어체 억양과 호흡으로 읽어주세요:\n\n"
+                + solo_clean
+            )
+            speech_cfg = types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=gemini_voice)
+                )
+            )
+
+        for gm_name in tts_models:
+            for retry_i in range(2):
+                try:
+                    resp = client.models.generate_content(
+                        model=gm_name,
+                        contents=tts_input_text,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=speech_cfg
+                        )
+                    )
+                    if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+                        for part in resp.candidates[0].content.parts:
+                            if part.inline_data and part.inline_data.data:
+                                raw_b = base64.b64decode(part.inline_data.data) if isinstance(part.inline_data.data, str) else part.inline_data.data
+                                m_type = getattr(part.inline_data, "mime_type", "audio/pcm")
+                                if _pcm_or_wav_to_mp3(raw_b, m_type, output_path, speed_rate=speed_rate):
+                                    mode_tag = f"NotebookLM 2인 대화 ({gemini_voice}+{gemini_partner_voice})" if gemini_dialogue else f"단독 ({gemini_voice})"
+                                    meta = {"used_engine": f"Gemini Native TTS ({gm_name} · {mode_tag})", "warning": ""}
+                                    return (output_path, meta) if return_meta else output_path
+                    break
+                except Exception as g_ex:
+                    err_memo = f"{gm_name}: {str(g_ex)[:140]}"
+                    if "429" in str(g_ex) and retry_i == 0:
+                        time.sleep(3)
+                        continue
+                    break
+
+    # 2) OpenAI TTS 호출
+    plain_script = re.sub(r'(진행자|파트너)\s*:\s*', '', clean_script).strip()
     if "OpenAI" in engine and openai_key:
-        headers = {
-            "Authorization": f"Bearer {openai_key}",
-            "Content-Type": "application/json"
-        }
-        chunks = _split_script_chunks(clean_script, max_chars=2800)
+        headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+        chunks = _split_script_chunks(plain_script, max_chars=2600)
         models_to_try = [openai_model, "tts-1-hd"] if openai_model == "gpt-4o-mini-tts" else [openai_model]
 
         for m_try in models_to_try:
-            safe_voice = openai_voice
-            if m_try != "gpt-4o-mini-tts" and safe_voice in ("ash", "coral", "sage", "ballad", "verse"):
-                safe_voice = "echo"
-
-            audio_parts = []
-            chunk_ok = True
+            safe_voice = openai_voice if (m_try == "gpt-4o-mini-tts" or openai_voice not in ("ash", "coral", "sage", "ballad", "verse")) else "echo"
+            audio_parts, chunk_ok = [], True
             for ch_txt in chunks:
-                payload = {
-                    "model": m_try,
-                    "input": ch_txt,
-                    "voice": safe_voice,
-                    "response_format": "mp3",
-                    "speed": speed_rate
-                }
+                payload = {"model": m_try, "input": ch_txt, "voice": safe_voice, "response_format": "mp3", "speed": speed_rate}
                 if m_try == "gpt-4o-mini-tts":
-                    payload["instructions"] = (
-                        "실제 사내 위생교육 전문 강사처럼 자연스럽고 또렷하며 생동감 있는 한국어 구어체로 말하세요. "
-                        "기계적인 낭독을 피하고 문맥에 맞춰 호흡과 억양을 명확하게 살려주세요."
-                    )
+                    payload["instructions"] = "실제 인기 팟캐스트 진행자처럼 아주 자연스럽고 생동감 있는 한국어 구어체로 대화하듯 말하세요."
                 try:
                     resp = requests.post("https://api.openai.com/v1/audio/speech", headers=headers, json=payload, timeout=90)
-                    # gpt-4o-mini-tts에서 speed 파라미터 충돌 시 speed 제외 후 즉시 재시도
-                    if resp.status_code == 400 and m_try == "gpt-4o-mini-tts" and "speed" in payload:
+                    if resp.status_code == 400 and "speed" in payload:
                         payload.pop("speed", None)
                         resp = requests.post("https://api.openai.com/v1/audio/speech", headers=headers, json=payload, timeout=90)
-
                     if resp.status_code == 200 and len(resp.content) > 300:
                         audio_parts.append(resp.content)
                     else:
-                        openai_err_msg = f"HTTP {resp.status_code}: {resp.text[:160]}"
+                        err_memo = f"HTTP {resp.status_code}"
                         chunk_ok = False
                         break
                 except Exception as ex:
-                    openai_err_msg = str(ex)
+                    err_memo = str(ex)
                     chunk_ok = False
                     break
-
             if chunk_ok and audio_parts:
                 with open(output_path, "wb") as f:
                     for part_bytes in audio_parts:
@@ -729,7 +809,7 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
                 meta = {"used_engine": f"OpenAI TTS ({m_try} / {safe_voice})", "warning": ""}
                 return (output_path, meta) if return_meta else output_path
 
-    # 2) Edge Neural TTS 호출 (남성/여성/중저음 보이스 정확 반영)
+    # 3) Edge Neural TTS 폴백
     if EDGE_TTS_AVAILABLE:
         try:
             pct = int(round((speed_rate - 1.0) * 100))
@@ -738,12 +818,12 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
             async def _save_edge():
                 if edge_pitch and edge_pitch != "+0Hz":
                     try:
-                        comm = edge_tts.Communicate(clean_script, voice=edge_voice, rate=rate_str, pitch=edge_pitch)
+                        comm = edge_tts.Communicate(plain_script, voice=edge_voice, rate=rate_str, pitch=edge_pitch)
                         await comm.save(output_path)
                         return
                     except TypeError:
                         pass
-                comm = edge_tts.Communicate(clean_script, voice=edge_voice, rate=rate_str)
+                comm = edge_tts.Communicate(plain_script, voice=edge_voice, rate=rate_str)
                 await comm.save(output_path)
 
             loop = asyncio.new_event_loop()
@@ -753,28 +833,21 @@ def create_natural_tts_audio(script_text, output_path, tts_config, return_meta=F
                 loop.close()
 
             if os.path.exists(output_path) and os.path.getsize(output_path) > 500:
-                warn_txt = ""
-                if "OpenAI" in engine:
-                    warn_txt = f"OpenAI TTS 응답 오류({openai_err_msg or '키 미입력/한도 초과'})로 인해 선택한 성별에 맞는 무료 신경망 성우({edge_voice}, {edge_pitch})로 자동 전환되었습니다."
-                meta = {"used_engine": f"Edge Neural TTS ({edge_voice} / {edge_pitch})", "warning": warn_txt}
+                warn_txt = f"선택 엔진 응답 오류({err_memo})로 신경망 성우({edge_voice})로 전환되었습니다." if "Edge" not in engine else ""
+                meta = {"used_engine": f"Edge Neural TTS ({edge_voice})", "warning": warn_txt}
                 return (output_path, meta) if return_meta else output_path
         except Exception as edge_ex:
-            openai_err_msg = f"{openai_err_msg} | Edge 오류: {edge_ex}"
+            err_memo = f"{err_memo} | {edge_ex}"
 
-    # 3) 최후 비상 폴백
-    tts = gTTS(text=clean_script, lang="ko", slow=False)
+    tts = gTTS(text=plain_script, lang="ko", slow=False)
     tts.save(output_path)
-    meta = {"used_engine": "Google 기본 TTS (gTTS)", "warning": openai_err_msg}
+    meta = {"used_engine": "Google 기본 TTS", "warning": err_memo}
     return (output_path, meta) if return_meta else output_path
 
 # ==========================================
-# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진 (이미지 잘림 0% 보존)
+# [9] Full HD (1920x1080) 고해상도 슬라이드 렌더링 엔진
 # ==========================================
 def paste_image_contain(base_img, img_bytes, box_coords, bg_color=(248, 250, 252)):
-    """
-    어떤 비율(16:9, 4:3, 1:1)의 그림이나 사진이 들어와도 상하좌우가 절대 잘리지 않도록
-    원본 비율을 100% 유지(contain)하여 박스 정중앙에 깔끔하게 배치합니다.
-    """
     x1, y1, x2, y2 = box_coords
     target_w = max(10, x2 - x1)
     target_h = max(10, y2 - y1)
@@ -791,7 +864,6 @@ def paste_image_contain(base_img, img_bytes, box_coords, bg_color=(248, 250, 252
         return False
 
 def paste_circular_avatar(base_img, photo_bytes, center_x, center_y, radius, border_color, border_width=6):
-    """부문장님 얼굴 사진을 원형으로 깔끔하게 크롭하여 배지 안에 합성합니다."""
     draw = ImageDraw.Draw(base_img)
     diam = radius * 2
     if photo_bytes:
@@ -833,10 +905,6 @@ def draw_background_grid_hd(draw, width, height, theme_mode):
         draw.rectangle([(36, 36), (width - 36, height - 36)], outline=(6, 95, 70), width=1)
 
 def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font_config, theme_mode, leader_photos=None):
-    """
-    모든 슬라이드를 Full HD (1920x1080) 고해상도 PNG로 렌더링합니다.
-    미리보기, PPTX 슬라이드, MP4 영상에 100% 동일하게 사용됩니다.
-    """
     width, height = 1920, 1080
 
     if slide_data.get("custom_image_bytes"):
@@ -869,9 +937,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
     is_light = "10월" in theme_mode
     leader_photos = leader_photos or {}
 
-    # ---------------------------------------------------------
-    # [1] INTRO_1TOP_3BOT: 상단 생산본부장 와이드 + 하단 3개 부문장 3열 (깃허브 얼굴 사진 원형 합성)
-    # ---------------------------------------------------------
     if layout in ("INTRO_1TOP_3BOT", "INTRO_4GRID"):
         draw.rectangle([(0, 0), (width, height)], fill=(244, 246, 250))
         title_txt = slide_data.get("title", "월간 위생교육 전 당부말씀")
@@ -959,9 +1024,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         img.save(output_path, quality=95)
         return output_path
 
-    # ---------------------------------------------------------
-    # [2] OUTRO_EVENT: '이벤트 페이지.pptx' 고정 양식 100% 재현
-    # ---------------------------------------------------------
     if layout == "OUTRO_EVENT":
         draw_background_grid_hd(draw, width, height, "10월 스타일")
 
@@ -1031,16 +1093,12 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         img.save(output_path, quality=95)
         return output_path
 
-    # 공통 배경 그리드
     draw_background_grid_hd(draw, width, height, theme_mode)
     text_main_col = (15, 23, 42) if is_light else (248, 250, 252)
     text_sub_col = (51, 65, 85) if is_light else (203, 213, 225)
     card_bg_col = (255, 255, 255) if is_light else (15, 28, 48)
     card_border_col = (30, 64, 175) if is_light else (16, 185, 129)
 
-    # ---------------------------------------------------------
-    # [3] COVER: 고해상도 표지 (우측에 잘림 없는 대표 도면 배치)
-    # ---------------------------------------------------------
     if layout == "COVER":
         box_x1, box_y1, box_x2, box_y2 = 110, 150, 1810, 930
         draw.rounded_rectangle([(box_x1 + 8, box_y1 + 8), (box_x2 + 8, box_y2 + 8)], radius=26, fill=(203, 213, 225) if is_light else (5, 10, 20))
@@ -1078,15 +1136,11 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
         img.save(output_path, quality=95)
         return output_path
 
-    # 공통 상단 타이틀 헤더 바
     header_bg = (30, 58, 138) if is_light else (15, 28, 48)
     draw.rectangle([(60, 46), (1860, 152)], fill=header_bg, outline=card_border_col, width=3)
     draw.rectangle([(60, 46), (82, 152)], fill=(56, 189, 248) if is_light else (16, 185, 129))
     draw.text((108, 70), slide_data.get("title", f"슬라이드 {slide_idx + 1}"), font=f_title, fill=(255, 255, 255))
 
-    # ---------------------------------------------------------
-    # [4] TABLE_MATRIX: 어긋남 없는 정밀 표 렌더링
-    # ---------------------------------------------------------
     if layout == "TABLE_MATRIX" and slide_data.get("table_headers") and slide_data.get("table_rows"):
         headers = slide_data["table_headers"]
         rows = slide_data["table_rows"]
@@ -1122,9 +1176,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                     draw.text((cx1 + 22, cy), cl, font=c_font, fill=text_main_col if c_i == 0 else text_sub_col)
                     cy += 39
 
-    # ---------------------------------------------------------
-    # [5] SPLIT_VISUAL: 좌측 슬라이드 맞춤 AI 도면(잘림 없는 contain 배치) + 우측 핵심 카드
-    # ---------------------------------------------------------
     elif layout == "SPLIT_VISUAL" or slide_data.get("visual_bytes"):
         vx1, vy1, vx2, vy2 = 65, 184, 915, 970
         draw.rounded_rectangle([(vx1, vy1), (vx2, vy2)], radius=18, fill=card_bg_col, outline=card_border_col, width=4)
@@ -1171,9 +1222,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                 draw.text((rx1 + 38, by), bl, font=f_body, fill=text_sub_col)
                 by += 40
 
-    # ---------------------------------------------------------
-    # [6] CARDS_3COL / TOC_STEP / SELF_AUDIT_2X2
-    # ---------------------------------------------------------
     else:
         cards = slide_data.get("cards", [])
         if not cards:
@@ -1232,7 +1280,6 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
                     draw.text((cx1 + 24, by), bl, font=f_body, fill=text_sub_col)
                     by += 43
 
-    # 하단 요약 원칙 배너 & 페이지 번호
     bottom_banner = slide_data.get("bottom_summary", "")
     if bottom_banner:
         draw.rounded_rectangle([(65, 990), (1670, 1054)], radius=12, fill=(254, 242, 242) if is_light else (6, 78, 59), outline=(239, 68, 68) if is_light else (16, 185, 129), width=3)
@@ -1245,13 +1292,9 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
     return output_path
 
 # ==========================================
-# [10] 고해상도 이미지 기반 파워포인트(.pptx) 생성기 (깨짐 0%)
+# [10] 고해상도 이미지 기반 파워포인트(.pptx) 생성기
 # ==========================================
 def generate_highres_image_pptx(slides_data, font_config, theme_mode, leader_photos=None):
-    """
-    미리보기와 100% 똑같은 Full HD(1920x1080) 렌더링 이미지를 각 슬라이드 전체 화면(16:9)에 얹어
-    표 깨짐, 도형 밀림, PC별 폰트 누락을 완벽하게 차단합니다. (발표자 노트에 성우 대본 자동 수록)
-    """
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -1279,15 +1322,23 @@ def generate_highres_image_pptx(slides_data, font_config, theme_mode, leader_pho
     pptx_io.seek(0)
     return pptx_io.getvalue()
 
-def build_fixed_event_slide(month_int, rank1, rank2, rank3, prize_amount="10,000원", prize_item="상당의 커피 기프티콘 증정"):
+def build_fixed_event_slide(month_int, rank1, rank2, rank3, prize_amount="10,000원", prize_item="상당의 커피 기프티콘 증정", dialogue_mode=True):
     month_str = f"{month_int}월"
     ranks_str = f"{rank1}번째, {rank2}번째, {rank3}번째"
-    script_text = (
-        f"자, 오늘 준비한 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 임직원 여러분 정말 고생 많으셨습니다. "
-        f"끝으로 기다리시던 {month_str} 위생교육 이벤트 안내드릴게요! "
-        f"이번 {month_str}에는 퀴즈 만점자분들 중 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 "
-        f"{prize_amount} {prize_item} 혜택을 드립니다. 지금 바로 퀴즈도 푸시고 시원한 커피 기프티콘의 주인공이 되어보세요! 감사합니다."
-    )
+    if dialogue_mode:
+        script_text = (
+            f"진행자: 자, 오늘 함께 살펴본 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 아산공장 임직원 여러분 정말 고생 많으셨어요.\n"
+            f"파트너: 맞습니다! 그리고 여러분이 가장 기다리시는 시간이죠, {month_str} 위생교육 퀴즈 이벤트 소식도 빠질 수 없잖아요?\n"
+            f"진행자: 네, 이번 {month_str}에는 위생교육 퀴즈 만점자분들 중에서 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 {prize_amount} {prize_item} 혜택을 드립니다!\n"
+            f"파트너: 오늘 배운 핵심 수칙들 가볍게 복습하시면서 지금 바로 퀴즈 참여하시고, 기분 좋은 커피 기프티콘의 주인공이 되어보세요! 오늘도 안전한 하루 보내세요, 감사합니다!"
+        )
+    else:
+        script_text = (
+            f"자, 오늘 준비한 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 임직원 여러분 정말 고생 많으셨습니다. "
+            f"끝으로 기다리시던 {month_str} 위생교육 이벤트 안내드릴게요! "
+            f"이번 {month_str}에는 퀴즈 만점자분들 중 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 "
+            f"{prize_amount} {prize_item} 혜택을 드립니다. 지금 바로 퀴즈도 푸시고 시원한 커피 기프티콘의 주인공이 되어보세요! 감사합니다."
+        )
     return {
         "layout": "OUTRO_EVENT",
         "type": "OUTRO",
@@ -1314,9 +1365,9 @@ def media_worker(idx, slide_data, total_slides, temp_dir, font_config, theme_mod
     return idx, img_path, audio_path
 
 # ==========================================
-# [11] Gemini 3.8 Flash 기획 엔진 (google-genai SDK / AQ. 키 완벽 호환)
+# [11] Gemini 3.8 Flash 기획 및 10~15분 심층/대화형 대본 확장 엔진
 # ==========================================
-def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text):
+def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text, dialogue_mode=True):
     client = get_genai_client(GEMINI_API_KEY)
     generation_config = types.GenerateContentConfig(temperature=0.25, max_output_tokens=65536)
 
@@ -1329,16 +1380,28 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
           2) {{"header": "유제품생산부문", "sub": "유제품생산부문장", "body": "..."}}
           3) {{"header": "상온제품생산부문", "sub": "상온제품생산부문장", "body": "..."}}
           4) {{"header": "품질안전부문", "sub": "품질안전부문장", "body": "..."}}
-        - "script"에는 딱딱한 기계식 낭독이 아니라, 활기차고 신뢰감 있는 사내 방송 진행자 톤으로 생산본부장님과 각 부문장님의 핵심 당부 포인트를 귀에 쏙쏙 들어오게 브리핑하십시오.
         - [입력된 당부 말씀 원문]:\n{intro_config.get("custom_text", "")}
         """
     else:
         intro_instruction = "[인트로 생략]: INTRO_1TOP_3BOT 없이 표지(COVER)부터 시작하십시오."
 
+    if dialogue_mode:
+        script_style_rule = """
+        [성우 대본("script") 작성 절대 원칙 - NotebookLM 2인 티키타카 대화형]:
+        - 반드시 `진행자:`와 `파트너:` 두 명의 화자가 실제 스튜디오에서 마주 앉아 자연스럽게 묻고 답하며 맞장구치는 대화 형식으로 작성하십시오!
+        - 각 발화 줄 맨 앞에 정확히 `진행자: ` 또는 `파트너: `를 붙이고 줄바꿈(`\\n`)으로 구분하십시오.
+        - 기계적인 낭독투 대신 "어? 그런데 현장에서 이 부분은 왜 특히 조심해야 할까요?", "아, 그거 정말 중요한 포인트예요! 왜냐하면요," 같은 실제 사람의 호흡과 추임새를 살리되, 법적 수치와 팩트는 100% 정확히 전달하십시오.
+        """
+    else:
+        script_style_rule = """
+        [성우 대본("script") 작성 절대 원칙 - 1인 전문 강사 구어체]:
+        - 문어체("~함", "~바랍니다")를 피하고, 실제 인기 강사가 현장 작업자와 눈을 맞추며 대화하듯 생동감 있는 구어체("~거든요", "자, 여기서 꼭 기억할 포인트가 있습니다!")와 호흡용 쉼표(,)를 꼼꼼히 넣어 작성하십시오.
+        """
+
     system_prompt = f"""
     당신은 연세유업 아산공장 식품안전팀(담당자: 곽정혁)의 수석 위생교육 콘텐츠 디렉터이자 HACCP 전문가입니다.
     참고 동영상이나 문서가 주어지면 그 안의 **핵심 교육 내용·법적 기준·수치·원칙만 정확히 추출**하여 재구성하십시오.
-    (동영상 화면을 그대로 캡처하지 않고, 각 슬라이드 내용에 100% 맞춘 새로운 AI 일러스트/도면을 `{VISUAL_OMNI_MODEL}`이 직접 그릴 것입니다.)
+    원문에 없는 허위 수치나 규정을 임의로 추정·창작하지 마십시오.
     (※ 마지막 이벤트 안내 슬라이드는 파이썬 코드가 자동 결합하므로 생성하지 마십시오.)
 
     [교육 월]: {edu_month_str}
@@ -1351,19 +1414,13 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
     1. "COVER": 표지 슬라이드에도 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
     2. "TOC_STEP": 3~5단계 전체 교육 목차 카드.
     3. 본론 슬라이드({body_slide_count}장) 중 **최소 70% 이상을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하십시오!
-       - "SPLIT_VISUAL": 좌측에는 1:1 정사각형 AI 맞춤 도면이 들어가고, 우측에는 2~3개의 핵심 요약 카드("cards")가 배치됩니다.
-       - **[매우 중요] "visual_prompt" 작성 규칙:**
-         해당 슬라이드의 우측 카드("cards") 2~3개에 적힌 구체적인 설비·행동·위생 수칙이 **하나의 그림 안에 모두 시각적으로 표현되도록** 구체적인 영문 프롬프트를 작성하십시오!
-         * 예시: 우측 카드가 '1) 위생적 배치 및 오염 방지 설비(벽·바닥 이격, 아크릴 커버)'와 '2) 예방보전 및 유휴설비 관리(보호커버 랩핑)'라면,
-           -> `"visual_prompt": "Isometric 3D food factory diagram showing two clear scenes side by side: (Left) stainless steel processing equipment spaced away from walls and floor for easy cleaning with a transparent acrylic dust cover over the conveyor belt; (Right) an idle food machine neatly wrapped in protective clear plastic film with an inspection checklist, clean vector blueprint style, strictly no text or letters"`
-         * 그림 내부에 글자(Text/Letters)가 들어가지 않도록 `"strictly no text or letters"`를 항상 명시하십시오.
-       - "CARDS_3COL": 핵심 수치(예: "3mm 이상", "540 Lux", "15℃ 이하") 3열 비교가 꼭 필요한 1장에만 사용 ("metric" 필드에 짧은 강조 수치 기입).
-       - "TABLE_MATRIX": 기준표, 행정처분, 구역 비교 등 표가 꼭 필요한 1장에 사용 ("table_headers", "table_rows" 필수 작성).
-       - "SELF_AUDIT_2X2": 본론 가장 마지막 장은 현장 작업자용 '핵심 자가 진단 체크리스트' 4분할 카드로 구성하십시오 (각 줄 앞에 '☑ ' 또는 '□ ' 표기).
+       - 카드 본문("body") 줄머리 기호는 폰트 깨짐이 없는 하이픈(`- `)만 사용하십시오 (`•`, `□` 사용 금지).
+       - "visual_prompt": 해당 슬라이드의 우측 카드("cards")에 적힌 설비·행동·위생 수칙이 하나의 3D 아이소메트릭 도면 안에 직관적으로 묘사되도록 구체적인 영문 프롬프트를 작성하고, `"strictly no text or letters"`를 포함하십시오.
+       - "CARDS_3COL": 핵심 수치 비교가 필요한 1~2장에 사용 ("metric" 필드에 짧은 강조 수치 기입).
+       - "TABLE_MATRIX": 기준표나 구역 비교 등 표가 필요한 1~2장에 사용 ("table_headers", "table_rows" 필수 작성).
+       - "SELF_AUDIT_2X2": 본론 가장 마지막 장은 현장 작업자용 '핵심 자가 진단 체크리스트' 4분할 카드로 구성하십시오 (각 줄 앞에 `[V] ` 표기).
 
-    [성우 내레이션 대본("script") 작성 절대 원칙]:
-    - 문어체("~함", "~임", "~바랍니다"의 기계적 반복)를 피하고, **실제 사람이 눈을 맞추며 대화하듯 자연스럽고 생동감 넘치는 구어체("~거든요", "~해보면 어떨까요?", "자, 여기서 정말 중요한 포인트가 하나 있습니다!", "~해주시는 센스, 잊지 마세요!")**를 적절히 섞어 유쾌하고 몰입감 있게 작성하십시오.
-    - 오디오 성우가 자연스럽게 숨을 쉬며 읽을 수 있도록 쉼표(,)와 마침표(.)를 호흡 단위로 꼼꼼히 찍어주십시오.
+    {script_style_rule}
 
     [출력 형식 규칙]:
     먼저 <pre_calc> 태그 안에 슬라이드별 카드 구성과 맞춤형 도면 구상을 요약하고, 이어서 <json_output> 태그 안에 순수 JSON 배열만 출력하십시오. (코드 축약 및 '...' 생략 절대 금지)
@@ -1380,14 +1437,14 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
         "subtitle": "",
         "content": "",
         "cards": [
-          {{"header": "위생적 배치 및 오염 방지 설비", "sub": "", "metric": "벽·바닥 이격", "body": "• 세척·소독이 용이하도록 설비와 벽면, 바닥 사이에 충분한 작업 공간 및 이격 거리 확보\\n• 개방형 이송 라인 상부에는 이물 낙하 방지용 투명 아크릴 커버 설치"}},
-          {{"header": "예방보전 및 유휴설비 관리", "sub": "", "metric": "보호커버 랩핑", "body": "• 정기 점검표 기반 마모 부품, 가스켓, 볼트·너트 조임 상태 주기적 점검\\n• 장기 미사용 유휴설비는 세척·소독 후 보호 랩핑 처리 및 식별표 부착"}}
+          {{"header": "위생적 배치 및 오염 방지 설비", "sub": "", "metric": "벽·바닥 이격", "body": "- 세척·소독이 용이하도록 설비와 벽면, 바닥 사이에 충분한 작업 공간 및 이격 거리 확보\\n- 개방형 이송 라인 상부에는 이물 낙하 방지용 투명 아크릴 커버 설치"}},
+          {{"header": "예방보전 및 유휴설비 관리", "sub": "", "metric": "보호커버 랩핑", "body": "- 정기 점검표 기반 마모 부품, 가스켓, 볼트·너트 조임 상태 주기적 점검\\n- 장기 미사용 유휴설비는 세척·소독 후 보호 랩핑 처리 및 식별표 부착"}}
         ],
         "table_headers": [],
         "table_rows": [],
         "bottom_summary": "설비는 세척하기 편하게 띄워 배치하고, 쉬고 있는 설비는 랩핑 후 이름표를 붙여줍니다.",
-        "visual_prompt": "Isometric 3D technical illustration of a hygienic dairy factory floor: stainless steel machine positioned with clear gap from walls and floor, transparent acrylic shield over conveyor line, and a clean plastic-wrapped idle machine next to a maintenance checklist board, centered full view, strictly no text or letters",
-        "script": "자, 다음으로 우리 현장의 설비 배치와 유지관리 수칙을 함께 살펴볼까요? 설비를 배치할 때는 세척과 소독이 쉽도록 벽면이나 바닥에서 충분한 간격을 띄워주어야 하는데요..."
+        "visual_prompt": "Isometric 3D technical illustration of a hygienic dairy factory floor: stainless steel machine positioned with clear gap from walls and floor, transparent acrylic shield over conveyor line, and a clean plastic-wrapped idle machine, centered full view, strictly no text or letters",
+        "script": "진행자: 자, 이번에는 현장의 제조 설비를 어떻게 배치하고 관리해야 하는지 살펴볼까요?\\n파트너: 네! 현장에 가보면 설비가 벽에 딱 붙어 있지 않고 일정 간격 떨어져 있잖아요. 이게 다 청소와 소독을 구석구석 완벽하게 하기 위한 거군요!"
       }}
     ]
     </json_output>
@@ -1425,17 +1482,23 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
                 continue
             return None, None, f"AI 기획안 생성 오류 ({PLANNING_MODEL}): {e}"
 
-def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic):
+def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dialogue_mode=True):
     client = get_genai_client(GEMINI_API_KEY)
     slides_text_dump = "\n\n".join([f"[슬라이드 {p['page_num']} 텍스트]:\n{p['text']}" for p in pdf_pages_info])
+    spk_rule = (
+        "반드시 `진행자:`와 `파트너:` 두 명이 자연스럽게 질문하고 맞장구치며 설명하는 NotebookLM 2인 팟캐스트 대화 형식으로 작성하십시오."
+        if dialogue_mode else
+        "실제 전문 강사가 현장 작업자들과 눈을 맞추며 친근하게 설명하는 1인 구어체 내레이션으로 작성하십시오."
+    )
     prompt = f"""
     다음은 연세유업 아산공장 '{edu_month_str} 정기 위생교육 ({topic})' 슬라이드 총 {len(pdf_pages_info)}장의 텍스트입니다.
-    슬라이드 1번부터 {len(pdf_pages_info)}번까지 단 한 장도 빠짐없이, 실제 전문 강사가 현장 작업자들과 눈을 맞추며 친근하고 생동감 있게 설명하는 구어체 내레이션 대본(script)을 작성하십시오.
-    딱딱한 낭독투 대신 "~거든요", "자, 화면을 함께 보실까요?" 같은 자연스러운 연결어와 호흡용 쉼표(,)를 적극 활용하고, 수치는 100% 정확하게 전달하십시오.
+    슬라이드 1번부터 {len(pdf_pages_info)}번까지 단 한 장도 빠짐없이 대본(script)을 작성하십시오.
+    {spk_rule}
+    원문에 있는 수치는 100% 정확하게 전달하고 없는 사실을 추측하지 마십시오.
 
     반드시 아래 순수 JSON 배열 포맷으로만 출력하십시오 (개수: 정확히 {len(pdf_pages_info)}개):
     [
-      {{"page_num": 1, "title": "슬라이드 1 요약 제목", "script": "1번 슬라이드 생동감 있는 구어체 대본"}},
+      {{"page_num": 1, "title": "슬라이드 1 요약 제목", "script": "1번 슬라이드 생동감 있는 대본"}},
       ...
     ]
 
@@ -1445,17 +1508,18 @@ def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic):
     resp = client.models.generate_content(model=PLANNING_MODEL, contents=prompt)
     clean_j = re.sub(r'^```json\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE).strip()
     return json.loads(clean_j)
-def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target_minutes, voice_speed=1.02, extra_source_text=""):
+
+def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target_minutes, voice_speed=1.00, extra_source_text="", dialogue_mode=True):
     """
-    말하기 속도를 인위적으로 늦추지 않고 목표 교육 시간(예: 10~15분)을 충족하기 위해,
-    슬라이드를 4장 단위 배치로 나누어 원문 팩트 기반의 심층 현장 강의 구어체 대본으로 확장합니다.
+    말하기 속도를 늦추지 않고 목표 시간(10~15분)을 채우기 위해,
+    4장 단위 병렬 배치로 슬라이드별 대본을 팩트 기반 심층 대화/강의로 확장합니다.
     """
-    if not slides_data or target_minutes <= 5:
+    if not slides_data or target_minutes <= 4:
         return slides_data
 
-    chars_per_min = int(430 * float(voice_speed))
+    chars_per_min = int(420 * float(voice_speed))
     total_target_chars = int(target_minutes * chars_per_min)
-    current_total_chars = sum(len(str(s.get("script", "")).strip()) for s in slides_data)
+    current_total_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in slides_data)
 
     if current_total_chars >= int(total_target_chars * 0.92):
         return slides_data
@@ -1471,41 +1535,47 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
             weights.append(1.10)
     weight_sum = sum(weights) if sum(weights) > 0 else len(slides_data)
 
-    slide_targets = [max(240, int(total_target_chars * (w / weight_sum))) for w in weights]
+    slide_targets = [max(250, int(total_target_chars * (w / weight_sum))) for w in weights]
     source_excerpt = extra_source_text[:6000] if extra_source_text else ""
+
+    mode_guide = (
+        "반드시 `진행자: ...\\n파트너: ...` 형태의 2인 남녀 팟캐스트 티키타카 대화 형식을 유지하십시오! 한 슬라이드 안에서 진행자와 파트너가 4~6번 이상 자연스럽게 질문·공감·예시 설명을 주고받으며 진짜 사람끼리 대화하는 느낌을 극대화하십시오. (단, 발화자 이름 글자 수는 제외한 순수 대사 분량이 목표 글자 수를 넘어야 합니다.)"
+        if dialogue_mode else
+        "1인 전문 위생교육 강사가 현장에서 친근하게 풀어서 이야기하는 구어체 형식을 유지하십시오."
+    )
 
     def _expand_batch(batch_items):
         client = get_genai_client(GEMINI_API_KEY)
-        batch_Desc = []
+        batch_desc = []
         for s_idx, s_obj, min_ch in batch_items:
             cards_txt = json.dumps(s_obj.get("cards", []), ensure_ascii=False)
             tbl_txt = json.dumps(
                 {"headers": s_obj.get("table_headers", []), "rows": s_obj.get("table_rows", [])},
                 ensure_ascii=False
             )
-            batch_Desc.append(
+            batch_desc.append(
                 f"--- [슬라이드 인덱스: {s_idx}] ---\n"
-                f"• 레이아웃: {s_obj.get('layout', '')}\n"
-                f"• 제목: {s_obj.get('title', '')}\n"
-                f"• 본문/요약: {s_obj.get('content', '')} / {s_obj.get('bottom_summary', '')}\n"
-                f"• 카드 데이터: {cards_txt}\n"
-                f"• 표 데이터: {tbl_txt}\n"
-                f"• 기존 대본 초안: {s_obj.get('script', '')}\n"
-                f"• [필수 목표 글자 수]: 공백 포함 최소 {min_ch}자 ~ {min_ch + 110}자 이상 작성"
+                f"- 레이아웃: {s_obj.get('layout', '')}\n"
+                f"- 제목: {s_obj.get('title', '')}\n"
+                f"- 본문/요약: {s_obj.get('content', '')} / {s_obj.get('bottom_summary', '')}\n"
+                f"- 카드 데이터: {cards_txt}\n"
+                f"- 표 데이터: {tbl_txt}\n"
+                f"- 기존 대본 초안: {s_obj.get('script', '')}\n"
+                f"- [필수 목표 순수 대사 글자 수]: 공백 포함 최소 {min_ch}자 ~ {min_ch + 120}자 이상 작성"
             )
 
-        joined_batch = "\n\n".join(batch_Desc)
+        joined_batch = "\n\n".join(batch_desc)
         prompt = f"""
-        당신은 연세유업 아산공장 식품안전팀의 전문 위생교육 강사입니다.
-        이번 '{edu_month_str} 정기 위생교육 ({topic})' 영상이 법정 의무교육 시간 기준인 총 {target_minutes}분 분량을 정상 말하기 속도로 자연스럽게 채울 수 있도록, 아래 슬라이드들의 성우 내레이션 대본("script")을 심층 강의 수준으로 풍부하게 확장하십시오.
+        당신은 연세유업 아산공장 식품안전팀의 위생교육 방송 작가입니다.
+        이번 '{edu_month_str} 정기 위생교육 ({topic})' 영상이 법정 교육 시간 기준인 총 {target_minutes}분 분량을 정상 말속도로 자연스럽게 채울 수 있도록, 아래 슬라이드들의 대본("script")을 심층 확장하십시오.
 
-        [절대 준수 규칙 - 팩트 검증 및 분량]:
-        1. 추정·창작 절대 금지: 슬라이드 카드·표·기존 대본 및 참고 원문에 있는 사실, 기준, 수치만 사용하십시오. 원문에 없는 법령 수치, 과태료, 온도, 허위 사고 사례를 절대 임의로 지어내지 마십시오.
-        2. 고정 정보 보존:
-           - 'INTRO_1TOP_3BOT'(당부말씀) 슬라이드는 생산본부장, 유제품생산부문장, 상온제품생산부문장, 품질안전부문장 4분의 핵심 당부 내용을 한 분도 빠짐없이 자연스럽게 연결하여 브리핑하십시오.
-           - 'OUTRO_EVENT'(이벤트 안내) 슬라이드는 기존 대본에 적힌 당첨 순번 숫자와 경품 금액 문구를 100% 동일하게 유지하면서 이번 달 교육 핵심 당부 마무리를 덧붙이십시오.
-        3. 말 늘이기·단순 반복 금지: 같은 말을 반복하지 말고, ① 왜 이 위생 기준이 식품 안전과 직결되는지 원리 해설 → ② 아산공장 현장에서 작업 전·중·후 눈으로 확인하고 실천하는 구체적 요령 → ③ 현장에서 놓치기 쉬운 주의 포인트 순서로 매끄럽게 풀어서 각 슬라이드의 [필수 목표 글자 수]를 반드시 달성하십시오.
-        4. 구어체 호흡: 실제 강사가 현장 임직원과 소통하듯 자연스러운 구어체("~거든요", "자, 여기서 꼭 확인해야 할 부분은요,")와 호흡용 쉼표(,)를 꼼꼼히 찍고, 코드 축약이나 '...' 생략 없이 완전한 문장으로 작성하십시오.
+        [절대 준수 규칙]:
+        1. 팩트 엄수 (추정·창작 금지): 슬라이드 카드·표·기존 대본 및 참고 원문에 명시된 기준과 수치만 사용하십시오. 원문에 없는 과태료, 법조항 번호, 온도 수치를 절대 지어내지 마십시오.
+        2. 고정 슬라이드 보존:
+           - 'INTRO_1TOP_3BOT'(당부말씀)는 생산본부장, 유제품생산부문장, 상온제품생산부문장, 품질안전부문장 4분의 핵심 당부 말씀을 모두 빠짐없이 소개하고 현장 실천 다짐을 나누십시오.
+           - 'OUTRO_EVENT'(이벤트 안내)는 기존 대본의 당첨 순번 숫자와 경품 금액 문구를 100% 동일하게 유지하면서 이번 달 핵심 요약 인사를 덧붙이십시오.
+        3. 화법 및 구성: {mode_guide}
+           같은 문장을 반복하지 말고 ① 이 기준이 왜 식품 안전에 중요한지 배경 설명 → ② 작업 전·중·후 현장에서 눈으로 확인하는 구체적 실천 요령 → ③ 놓치기 쉬운 실수 예방 팁 순서로 풀어내어 각 슬라이드의 [필수 목표 순수 대사 글자 수]를 반드시 달성하십시오.
 
         [참고 원문 발췌]:
         {source_excerpt}
@@ -1513,9 +1583,9 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
         [확장 대상 슬라이드 목록]:
         {joined_batch}
 
-        반드시 아래 순수 JSON 배열 형식으로만 출력하십시오:
+        반드시 아래 순수 JSON 배열 형식으로만 출력하십시오 (축약 절대 금지):
         [
-          {{"slide_idx": 0, "script": "목표 글자 수를 완벽히 충족하는 자연스러운 심층 구어체 대본 전체"}},
+          {{"slide_idx": 0, "script": "목표 글자 수를 완벽히 충족하는 생동감 넘치는 대본 전체"}},
           ...
         ]
         """
@@ -1524,8 +1594,7 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
             try:
                 resp = client.models.generate_content(model=PLANNING_MODEL, contents=prompt, config=cfg)
                 raw = re.sub(r'^```json\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE).strip()
-                parsed = json.loads(raw)
-                return parsed
+                return json.loads(raw)
             except Exception:
                 time.sleep(2)
         return []
@@ -1553,6 +1622,7 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
                             slides_data[s_i]["script"] = new_sc
 
     return slides_data
+
 # ==========================================
 # [12] 메인 애플리케이션 UI
 # ==========================================
@@ -1568,48 +1638,63 @@ def main():
             else:
                 st.session_state[key] = None
 
-    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(10~15분 법정시간 맞춤 · 다중 성우 · AI 맞춤 도면)</span></h1>", unsafe_allow_html=True)
-    st.markdown("원본 교육 영상(MP4)·문서에서 핵심 팩트만 추출하여 **10~15분 분량의 심층 구어체 강의 대본**, **슬라이드별 AI 도면(잘림 0%)**, **남성/여성 맞춤형 성우 더빙**으로 완성합니다.")
+    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(NotebookLM 대화형 성우 · 10~15분 맞춤 · 3D 도면 통합판)</span></h1>", unsafe_allow_html=True)
+    st.markdown("유료 Gemini API 단일 연결로 **NotebookLM 스타일 2인 남녀 대화형 더빙**, **10~15분 법정 교육 시간 맞춤 대본**, **슬라이드별 3D 위생 도면**까지 원클릭으로 제작합니다.")
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # --- 좌측 사이드바 ---
     with st.sidebar:
-        st.header("🧠 고정 AI 엔진 상태")
-        key_type_label = "Gemini Developer API"
-        st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·심층대본:** `{PLANNING_MODEL}`\n• **맞춤 도면:** `{VISUAL_OMNI_MODEL}`")
+        st.header("🧠 유료 AI 엔진 직결 상태")
+        key_type_label = "Gemini Paid API (학습 차단 적용)"
+        st.info(f"• **연결 방식:** `{key_type_label}`\n• **기획·심층대본:** `{PLANNING_MODEL}`\n• **3D 맞춤 도면:** `{VISUAL_OMNI_MODEL}`")
 
         st.markdown("---")
-        st.header("🎙️ 성우 목소리 엔진 설정")
+        st.header("🎙️ 성우 목소리 & 대화 모드 설정")
         tts_engine = st.radio(
             "음성 합성 엔진 선택",
             [
-                "Edge Neural TTS (무료 신경망 성우 6종 - 즉시 변경 추천)",
-                "OpenAI TTS (ChatGPT 유료 크레딧 성우)"
+                "Gemini Native TTS (NotebookLM 동일 계열 · 초자연 대화형)",
+                "Edge Neural TTS (보조 신경망 성우 6종)",
+                "OpenAI TTS (ChatGPT 성우)"
             ],
             index=0
         )
-        openai_key_input = st.text_input(
-            "OpenAI API Key (OpenAI TTS / DALL-E용)",
-            value=DEFAULT_OPENAI_KEY,
-            type="password",
-            help="OpenAI 플랫폼 유료 크레딧이 충전된 키일 때만 OpenAI TTS가 작동합니다."
-        ).strip().strip('"').strip("'")
 
-        if "OpenAI" in tts_engine:
+        gemini_voice = "Kore"
+        gemini_partner_voice = "Puck"
+        gemini_dialogue = True
+        openai_model = "gpt-4o-mini-tts"
+        openai_voice = "nova"
+        edge_voice = "ko-KR-SunHiNeural"
+        edge_pitch = "+0Hz"
+        openai_key_input = DEFAULT_OPENAI_KEY
+
+        if "Gemini" in tts_engine:
+            gemini_voice_map = {
+                "🎙️ NotebookLM 2인 남녀 티키타카 (Kore 여성 + Puck 남성 - 강력 추천)": ("Kore", "Puck", True, "ko-KR-SunHiNeural"),
+                "🎙️ NotebookLM 2인 차분한 대담 (Aoede 여성 + Charon 중저음 남성)": ("Aoede", "Charon", True, "ko-KR-SunHiNeural"),
+                "Kore 단독 (지적이고 또렷한 대표 여성 강사)": ("Kore", "Puck", False, "ko-KR-SunHiNeural"),
+                "Aoede 단독 (부드럽고 친근한 대화형 여성 강사)": ("Aoede", "Puck", False, "ko-KR-SunHiNeural"),
+                "Puck 단독 (생동감 넘치고 활기찬 남성 강사)": ("Puck", "Kore", False, "ko-KR-InJoonNeural"),
+                "Charon 단독 (신뢰감 있는 중저음 남성 강사)": ("Charon", "Kore", False, "ko-KR-HyunsuMultilingualNeural"),
+                "Fenrir 단독 (힘 있고 명확한 현장 브리핑 남성)": ("Fenrir", "Kore", False, "ko-KR-InJoonNeural")
+            }
+            chosen_g_label = st.selectbox("NotebookLM / Gemini 보이스 선택", list(gemini_voice_map.keys()), index=0)
+            gemini_voice, gemini_partner_voice, gemini_dialogue, edge_voice = gemini_voice_map[chosen_g_label]
+        elif "OpenAI" in tts_engine:
+            openai_key_input = st.text_input("OpenAI API Key", value=DEFAULT_OPENAI_KEY, type="password").strip().strip('"').strip("'")
+            gemini_dialogue = False
             openai_model = st.selectbox("OpenAI 음성 모델", ["gpt-4o-mini-tts", "tts-1-hd"], index=0)
             openai_voice_map = {
                 "nova (밝고 활기찬 여성 강사)": ("nova", "ko-KR-SunHiNeural", "+0Hz"),
                 "shimmer (차분하고 신뢰감 있는 여성)": ("shimmer", "ko-KR-SunHiNeural", "-5Hz"),
-                "alloy (명쾌하고 깔끔한 여성/중성톤)": ("alloy", "ko-KR-SunHiNeural", "+3Hz"),
                 "echo (친근하고 부드러운 남성 강사)": ("echo", "ko-KR-InJoonNeural", "+0Hz"),
-                "onyx (무게감 있는 중저음 남성)": ("onyx", "ko-KR-HyunsuMultilingualNeural", "-3Hz"),
-                "ash (생동감 넘치는 경쾌한 남성)": ("ash", "ko-KR-InJoonNeural", "+5Hz")
+                "onyx (무게감 있는 중저음 남성)": ("onyx", "ko-KR-HyunsuMultilingualNeural", "-3Hz")
             }
             chosen_v_label = st.selectbox("ChatGPT 보이스 선택", list(openai_voice_map.keys()), index=0)
             openai_voice, edge_voice, edge_pitch = openai_voice_map[chosen_v_label]
         else:
-            openai_model = "tts-1-hd"
-            openai_voice = "nova"
+            gemini_dialogue = False
             edge_voice_map = {
                 "선희 (밝고 또렷한 여성 아나운서)": ("ko-KR-SunHiNeural", "+0Hz"),
                 "인준 (자연스러운 남성 아나운서)": ("ko-KR-InJoonNeural", "+0Hz"),
@@ -1618,13 +1703,17 @@ def main():
                 "인준 브라이트 (활기차고 경쾌한 남성 진행자)": ("ko-KR-InJoonNeural", "+5Hz"),
                 "현수 딥톤 (신뢰감 있는 중저음 남성 브리핑)": ("ko-KR-HyunsuMultilingualNeural", "-4Hz")
             }
-            chosen_e_label = st.selectbox("무료 신경망 성우 선택 (6종)", list(edge_voice_map.keys()), index=0)
+            chosen_e_label = st.selectbox("신경망 성우 선택 (6종)", list(edge_voice_map.keys()), index=0)
             edge_voice, edge_pitch = edge_voice_map[chosen_e_label]
 
-        voice_speed = st.slider("말하기 속도 배율 (자연스러운 기본속도 1.00~1.02 권장)", min_value=0.92, max_value=1.18, value=1.02, step=0.02)
+        voice_speed = st.slider("말하기 속도 배율 (자연스러운 정속 1.00 권장)", min_value=0.92, max_value=1.16, value=1.00, step=0.02)
 
         tts_config = {
             "engine": tts_engine,
+            "gemini_key": GEMINI_API_KEY,
+            "gemini_voice": gemini_voice,
+            "gemini_partner_voice": gemini_partner_voice,
+            "gemini_dialogue": gemini_dialogue,
             "openai_key": openai_key_input,
             "openai_model": openai_model,
             "openai_voice": openai_voice,
@@ -1633,18 +1722,20 @@ def main():
             "speed": voice_speed
         }
 
-        if st.button("🔊 현재 선택한 목소리 미리듣기", use_container_width=True):
+        if st.button("🔊 선택한 목소리 / 2인 대화 샘플 미리듣기", use_container_width=True):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_aud:
                 sample_path = tmp_aud.name
-            _, tts_meta = create_natural_tts_audio(
-                "안녕하세요! 연세유업 아산공장 임직원 여러분, 이번 달 정기 위생교육을 함께 시작해 보겠습니다.",
-                sample_path,
-                tts_config,
-                return_meta=True
+            sample_txt = (
+                "진행자: 안녕하세요 연세유업 아산공장 여러분! 오늘 위생교육도 귀에 쏙쏙 들어오게 같이 이야기 나눠볼까요?\n"
+                "파트너: 네, 반갑습니다! 현장에서 바로 써먹을 수 있는 핵심 포인트만 알기 쉽게 짚어드리겠습니다!"
+                if gemini_dialogue else
+                "안녕하세요! 연세유업 아산공장 임직원 여러분, 이번 달 정기 위생교육을 활기차게 시작해 보겠습니다."
             )
+            with st.spinner("실제 성우 오디오 샘플을 합성하고 있습니다..."):
+                _, tts_meta = create_natural_tts_audio(sample_txt, sample_path, tts_config, return_meta=True)
             with open(sample_path, "rb") as af:
                 st.audio(af.read(), format="audio/mp3")
-            st.caption(f"🎙️ 실제 출력 엔진: `{tts_meta.get('used_engine', '')}`")
+            st.caption(f"🎙️ 출력 확인: `{tts_meta.get('used_engine', '')}`")
             if tts_meta.get("warning"):
                 st.warning(tts_meta["warning"])
             if os.path.exists(sample_path):
@@ -1690,8 +1781,8 @@ def main():
 
     tab1, tab2, tab3 = st.tabs([
         "1. 교육 자료·목표 시간(10~15분) & 당부말씀 설정",
-        "2. 고해상도 슬라이드 미리보기 & 예상 시간·대본 편집",
-        "3. 고해상도 이미지 PPTX & 성우 MP4 렌더링"
+        "2. 고해상도 슬라이드 미리보기 & 대화 대본·도면 편집",
+        "3. 고해상도 이미지 PPTX & NotebookLM 성우 MP4 렌더링"
     ])
 
     # ==========================================
@@ -1718,8 +1809,8 @@ def main():
         workflow_mode = st.radio(
             "본론 슬라이드 생성 방식:",
             [
-                "표준 모드: 참고 교육 영상(MP4)·문서(PPTX/PDF) 내용 분석 ➡️ AI 맞춤 도면 & 목표 시간(10~15분) 맞춤 심층 대본 제작",
-                "PDF 직행 모드: 이미 완성된 슬라이드 PDF 업로드 ➡️ 원본 디자인 유지 + 앞뒤 당부말씀·이벤트 결합 및 목표 시간 맞춤 성우 더빙"
+                "표준 모드: 참고 교육 영상(MP4)·문서(PPTX/PDF) 분석 ➡️ 3D 맞춤 도면 & 10~15분 대화형/강의형 대본 자동 제작",
+                "PDF 직행 모드: 이미 완성된 슬라이드 PDF 업로드 ➡️ 원본 디자인 유지 + 당부말씀·이벤트 결합 및 목표 시간 맞춤 더빙"
             ],
             index=0
         )
@@ -1852,11 +1943,12 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        if st.button(f"🚀 목표 {target_video_mins}분 맞춤 심층 대본 & AI 슬라이드 도면 일괄 생성 시작", type="primary", use_container_width=True):
+        mode_btn_label = "NotebookLM 2인 대화형" if gemini_dialogue else "전문 강사 구어체"
+        if st.button(f"🚀 목표 {target_video_mins}분 맞춤 [{mode_btn_label}] 대본 & 3D 슬라이드 일괄 생성 시작", type="primary", use_container_width=True):
             if not GEMINI_API_KEY:
                 st.error("Streamlit Secrets에 GOOGLE_API_KEY 또는 GEMINI_API_KEY를 설정해주세요.")
             elif "표준 모드" in workflow_mode:
-                with st.spinner(f"1/2단계: [{PLANNING_MODEL}] 슬라이드 구성 및 [{VISUAL_OMNI_MODEL}] 맞춤 3D 도면 생성 중..."):
+                with st.spinner(f"1/2단계: [{PLANNING_MODEL}] 슬라이드 기획 및 [{mode_btn_label}] 초안 설계 중..."):
                     gemini_files = []
                     combined_text = extra_source_text
 
@@ -1883,7 +1975,7 @@ def main():
 
                     intro_cfg = {"mode": intro_mode, "custom_text": intro_custom_text}
                     slides, pre_log, err = generate_ai_storyboard(
-                        topic, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text
+                        topic, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text, dialogue_mode=gemini_dialogue
                     )
 
                 if err:
@@ -1904,16 +1996,17 @@ def main():
                             ]
 
                     if include_outro:
-                        slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount))
+                        slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount, dialogue_mode=gemini_dialogue))
 
-                    with st.spinner(f"2/2단계: 정상 말속도 기준 약 {target_video_mins}분 분량 충족을 위한 슬라이드별 심층 강의 대본 확장 및 3D 도면 렌더링 중..."):
+                    with st.spinner(f"2/2단계: 약 {target_video_mins}분 분량 [{mode_btn_label}] 대본 심층 확장 및 [{VISUAL_OMNI_MODEL}] 3D 도면 생성 중..."):
                         slides = expand_scripts_for_target_duration(
                             slides,
                             topic=topic,
                             edu_month_str=edu_month_str,
                             target_minutes=target_video_mins,
                             voice_speed=voice_speed,
-                            extra_source_text=f"{intro_custom_text}\n\n{combined_text}"
+                            extra_source_text=f"{intro_custom_text}\n\n{combined_text}",
+                            dialogue_mode=gemini_dialogue
                         )
 
                         local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
@@ -1936,25 +2029,32 @@ def main():
                                 r_i, r_s = vf.result()
                                 slides[r_i] = r_s
 
-                    total_chars_done = sum(len(str(s.get("script", "")).strip()) for s in slides)
-                    est_min_done = (total_chars_done / (425.0 * voice_speed)) + (len(slides) * 0.6 / 60.0)
+                    pure_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in slides)
+                    est_min_done = (pure_chars / (420.0 * voice_speed)) + (len(slides) * 0.6 / 60.0)
                     st.session_state["slides_data"] = slides
                     st.session_state["pre_calc_log"] = pre_log
                     st.session_state["final_video_bytes"] = None
                     st.session_state["final_pptx_bytes"] = None
-                    st.success(f"총 {len(slides)}장 생성 완료! (전체 대본 {total_chars_done:,}자 · 정상 배속 기준 예상 재생 시간 약 {est_min_done:.1f}분) [2번 탭]에서 확인하세요.")
+                    st.success(f"총 {len(slides)}장 생성 완료! (순수 대사 {pure_chars:,}자 · 정상 배속 예상 시간 약 {est_min_done:.1f}분) [2번 탭]에서 확인하세요.")
             else:
                 if not existing_pdf_file:
                     st.warning("PDF 파일을 먼저 업로드해주세요.")
                 elif not PYMUPDF_AVAILABLE:
                     st.error("requirements.txt에 PyMuPDF를 추가해주세요.")
                 else:
-                    with st.spinner(f"PDF 전 페이지 고해상도 추출 및 목표 {target_video_mins}분 맞춤 심층 더빙 대본 생성 중..."):
+                    with st.spinner(f"PDF 고해상도 추출 및 목표 {target_video_mins}분 [{mode_btn_label}] 대본 생성 중..."):
                         pages_info = extract_pages_from_pdf(existing_pdf_file.getvalue())
-                        scripts_list = generate_scripts_for_existing_pdf(pages_info, edu_month_str, topic)
+                        scripts_list = generate_scripts_for_existing_pdf(pages_info, edu_month_str, topic, dialogue_mode=gemini_dialogue)
                         built_slides = []
 
                         if intro_mode != "당부 말씀 슬라이드 생략":
+                            intro_sc = (
+                                f"진행자: 안녕하세요 연세유업 아산공장 임직원 여러분! {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 짚어보겠습니다. 먼저 생산본부장님께서는 {ldr_prod}\n"
+                                f"파트너: 네, 이어서 유제품생산부문장님께서는 {ldr_dairy} 그리고 상온제품생산부문장님께서는 {ldr_ambient}\n"
+                                f"진행자: 끝으로 품질안전부문장님께서는 {ldr_qc} 라고 강조해 주셨습니다. 현장에서 꼭 함께 실천해 주시길 바랍니다!"
+                                if gemini_dialogue else
+                                f"안녕하세요, 연세유업 아산공장 임직원 여러분! {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
+                            )
                             intro_slide_obj = {
                                 "layout": "INTRO_1TOP_3BOT",
                                 "type": "INTRO",
@@ -1965,7 +2065,7 @@ def main():
                                     {"header": "상온제품생산부문", "sub": "상온제품생산부문장", "body": ldr_ambient},
                                     {"header": "품질안전부문", "sub": "품질안전부문장", "body": ldr_qc}
                                 ],
-                                "script": f"안녕하세요, 연세유업 아산공장 임직원 여러분! {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
+                                "script": intro_sc
                             }
                             if st.session_state.get("intro_full_slide_bytes") and "통째로" in intro_mode:
                                 intro_slide_obj["custom_image_bytes"] = st.session_state["intro_full_slide_bytes"]
@@ -1985,7 +2085,7 @@ def main():
                             })
 
                         if include_outro:
-                            built_slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount))
+                            built_slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount, dialogue_mode=gemini_dialogue))
 
                         built_slides = expand_scripts_for_target_duration(
                             built_slides,
@@ -1993,59 +2093,66 @@ def main():
                             edu_month_str=edu_month_str,
                             target_minutes=target_video_mins,
                             voice_speed=voice_speed,
-                            extra_source_text=f"{intro_custom_text}\n\n{pdf_full_txt}"
+                            extra_source_text=f"{intro_custom_text}\n\n{pdf_full_txt}",
+                            dialogue_mode=gemini_dialogue
                         )
 
-                        total_chars_done = sum(len(str(s.get("script", "")).strip()) for s in built_slides)
-                        est_min_done = (total_chars_done / (425.0 * voice_speed)) + (len(built_slides) * 0.6 / 60.0)
+                        pure_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in built_slides)
+                        est_min_done = (pure_chars / (420.0 * voice_speed)) + (len(built_slides) * 0.6 / 60.0)
                         st.session_state["slides_data"] = built_slides
                         st.session_state["final_video_bytes"] = None
                         st.session_state["final_pptx_bytes"] = None
-                        st.success(f"총 {len(built_slides)}장 준비 완료! (전체 대본 {total_chars_done:,}자 · 예상 재생 시간 약 {est_min_done:.1f}분) [2번 탭]으로 이동하세요.")
+                        st.success(f"총 {len(built_slides)}장 준비 완료! (순수 대사 {pure_chars:,}자 · 예상 시간 약 {est_min_done:.1f}분) [2번 탭]으로 이동하세요.")
 
     # ==========================================
-    # 탭 2: Full-HD 슬라이드 미리보기 & AI 맞춤 도면/대본 편집
+    # 탭 2: Full-HD 슬라이드 미리보기 & 대화 대본/도면 편집
     # ==========================================
     with tab2:
         if not st.session_state.get("slides_data"):
             st.info("먼저 [1번 탭]에서 슬라이드 기획을 실행해 주십시오.")
         else:
             total_s = len(st.session_state["slides_data"])
-            total_script_chars = sum(len(str(s.get("script", "")).strip()) for s in st.session_state["slides_data"])
-            est_total_sec = int((total_script_chars / (7.1 * voice_speed)) + (total_s * 0.6))
+            pure_total_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in st.session_state["slides_data"])
+            est_total_sec = int((pure_total_chars / (7.0 * voice_speed)) + (total_s * 0.6))
             est_mm, est_ss = divmod(est_total_sec, 60)
 
-            st.markdown("### 🖥️ Full-HD(1920×1080) 슬라이드 미리보기 및 AI 맞춤 도면·대본 편집")
+            st.markdown("### 🖥️ Full-HD(1920×1080) 슬라이드 미리보기 및 대화형 대본·3D 도면 편집")
             st.info(
-                f"⏱️ **현재 대본 분량 진단:** 총 **{total_s}장** | 전체 대본 **{total_script_chars:,}자** (공백 포함) "
-                f"➡️ 현재 속도(`{voice_speed:.2f}x`) 기준 **예상 영상 길이: 약 {est_mm}분 {est_ss:02d}초**"
+                f"⏱️ **현재 대본 분량 진단:** 총 **{total_s}장** | 순수 대사 **{pure_total_chars:,}자** "
+                f"➡️ 현재 속도(`{voice_speed:.2f}x`) 기준 **예상 영상 길이: 약 {est_mm}분 {est_ss:02d}초** "
+                f"({'NotebookLM 2인 대화 모드' if gemini_dialogue else '1인 강사 모드'})"
             )
 
             updated_slides = []
 
             with tempfile.TemporaryDirectory() as preview_dir:
                 for idx, slide in enumerate(st.session_state["slides_data"]):
-                    cur_len = len(str(slide.get("script", "")).strip())
-                    cur_sec = int(cur_len / (7.1 * voice_speed))
+                    cur_pure_len = len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(slide.get("script", ""))).strip())
+                    cur_sec = int(cur_pure_len / (7.0 * voice_speed))
                     is_expanded = (idx in (0, 1, total_s - 1))
-                    with st.expander(f"슬라이드 {idx + 1} [{slide.get('layout', 'SLIDE')}] : {slide.get('title', '')} ({cur_len}자 · 약 {cur_sec}초)", expanded=is_expanded):
+                    with st.expander(f"슬라이드 {idx + 1} [{slide.get('layout', 'SLIDE')}] : {slide.get('title', '')} ({cur_pure_len}자 · 약 {cur_sec}초)", expanded=is_expanded):
                         col_p1, col_p2 = st.columns([1.2, 1])
                         with col_p2:
                             new_title = st.text_input("슬라이드 제목", value=slide.get("title", ""), key=f"t_{idx}")
-                            new_script = st.text_area("성우 내레이션 대본 (구어체)", value=slide.get("script", ""), height=185, key=f"s_{idx}")
+                            new_script = st.text_area(
+                                "성우 대본 (`진행자:` / `파트너:` 태그 유지 시 2인 대화 합성)",
+                                value=slide.get("script", ""),
+                                height=195,
+                                key=f"s_{idx}"
+                            )
                             slide["title"] = new_title
                             slide["script"] = new_script
 
                             if slide.get("layout") in ("SPLIT_VISUAL", "COVER", "CARDS_3COL"):
                                 new_v_prompt = st.text_input(
-                                    "AI 도면 생성 지시문 (우측 카드 내용과 자동 결합됨)",
+                                    "AI 3D 도면 생성 지시문 (우측 카드 내용과 자동 결합됨)",
                                     value=slide.get("visual_prompt", ""),
                                     key=f"vp_{idx}"
                                 )
                                 slide["visual_prompt"] = new_v_prompt
 
-                                if st.button(f"🎨 이 슬라이드 내용에 맞춰 AI 도면({VISUAL_OMNI_MODEL}) 다시 그리기", key=f"regen_v_{idx}", use_container_width=True):
-                                    with st.spinner(f"슬라이드 {idx + 1}의 카드 내용을 바탕으로 AI 맞춤 도면을 새로 그리고 있습니다..."):
+                                if st.button(f"🎨 이 슬라이드 3D 도면({VISUAL_OMNI_MODEL}) 다시 그리기", key=f"regen_v_{idx}", use_container_width=True):
+                                    with st.spinner(f"슬라이드 {idx + 1}의 3D 맞춤 도면을 새로 생성하고 있습니다..."):
                                         slide["layout"] = "SPLIT_VISUAL" if slide.get("layout") != "COVER" else "COVER"
                                         slide["visual_bytes"] = generate_ai_illustration(
                                             slide,
@@ -2078,7 +2185,7 @@ def main():
             st.session_state["slides_data"] = updated_slides
 
     # ==========================================
-    # 탭 3: 고해상도 이미지 PPTX 및 자연스러운 성우 MP4 렌더링
+    # 탭 3: 고해상도 이미지 PPTX 및 NotebookLM 성우 MP4 렌더링
     # ==========================================
     with tab3:
         if not st.session_state.get("slides_data"):
@@ -2097,7 +2204,7 @@ def main():
                             theme_mode,
                             leader_photos=st.session_state["leader_photos"]
                         )
-                        st.success("고해상도 이미지 PPTX 생성 완료! (미리보기와 100% 동일하며 발표자 노트에 전체 심층 대본이 포함되어 있습니다)")
+                        st.success("고해상도 이미지 PPTX 생성 완료! (발표자 노트에 대본이 수록되어 있습니다)")
 
                 if st.session_state.get("final_pptx_bytes"):
                     st.download_button(
@@ -2109,15 +2216,15 @@ def main():
                     )
 
             with col_b2:
-                if st.button("🎥 2단계: 선택한 성우 더빙 + Full-HD 장시간 MP4 영상 렌더링", type="primary", use_container_width=True):
+                if st.button("🎥 2단계: NotebookLM 대화형 성우 + Full-HD MP4 영상 렌더링", type="primary", use_container_width=True):
                     t_start = time.time()
                     with tempfile.TemporaryDirectory() as temp_dir:
                         total_cnt = len(slides_to_render)
-                        p_bar = st.progress(0, text="병렬 엔진 가동: Full-HD 슬라이드 및 성우 오디오 동시 합성 중...")
+                        p_bar = st.progress(0, text="병렬 엔진 가동: Full-HD 슬라이드 및 Gemini Native TTS 오디오 동시 합성 중...")
 
                         media_results = [None] * total_cnt
                         local_leader_photos = dict(st.session_state.get("leader_photos", {}))
-                        with ThreadPoolExecutor(max_workers=4) as executor:
+                        with ThreadPoolExecutor(max_workers=3) as executor:
                             futures = [
                                 executor.submit(
                                     media_worker,
@@ -2139,7 +2246,7 @@ def main():
                                 done_cnt += 1
                                 p_bar.progress(done_cnt / (total_cnt + 1), text=f"({done_cnt}/{total_cnt}) 고해상도 화면 및 성우 오디오 합성 완료...")
 
-                        p_bar.progress(total_cnt / (total_cnt + 1), text="최종 Full-HD MP4 교육 영상 병합 인코딩 중 (10~15분 분량은 약 1~2분 소요)...")
+                        p_bar.progress(total_cnt / (total_cnt + 1), text="최종 Full-HD MP4 교육 영상 병합 인코딩 중...")
                         v_clips, a_clips = [], []
                         try:
                             for img_path, audio_path in media_results:
