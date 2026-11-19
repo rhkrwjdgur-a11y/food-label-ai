@@ -746,7 +746,7 @@ def generate_ai_illustration(slide_obj, fallback_topic, theme_style, openai_key=
     return generate_procedural_infographic(slide_obj, theme_style, custom_font_paths=custom_font_paths)
 
 # ==========================================
-# [8] 초자연 성우 엔진 (남성 진행자 고정 + 유료 Gemini Native TTS + OpenAI + Edge)
+# [8] 초자연 성우 엔진 및 오프닝·연도 자동 보정기
 # ==========================================
 def _split_script_chunks(text, max_chars=2600):
     lines = re.split(r'\n+|(?<=[.!?。])\s+', text.strip())
@@ -847,6 +847,35 @@ def enforce_opening_greeting(slides_data, dialogue_mode=True):
         else:
             solo_sc = generic_hello_regex.sub("", solo_sc).strip()
         slides_data[0]["script"] = f"{MANDATORY_OPENING_LINE} {solo_sc}".strip()
+
+    return slides_data
+
+def enforce_edu_year_consistency(slides_data, edu_year_num, edu_month_num):
+    """
+    AI가 표지(COVER) 제목·부제목이나 대본에서 교육 기준 연도를 2024년·2025년 등 과거 연도로
+    잘못 표기한 경우 사용자가 입력한 기준 연도(예: 2026년)로 일괄 교정하고 표지 하단 라벨을 동기화합니다.
+    """
+    if not slides_data:
+        return slides_data
+
+    ym_label = f"{edu_year_num}년 {edu_month_num:02d}월"
+    wrong_ym_pattern = re.compile(rf"20\d{{2}}\s*년\s*0?{int(edu_month_num)}\s*월")
+    correct_ym_text = f"{edu_year_num}년 {edu_month_num}월"
+
+    for s in slides_data:
+        s["edu_ym_label"] = ym_label
+        lay = s.get("layout", "")
+
+        # 표지(COVER)의 제목/부제목/본문에 들어간 모든 20XX년 표기를 입력한 교육 연도로 강제 일치
+        if lay == "COVER":
+            for field in ("title", "subtitle", "content"):
+                if s.get(field):
+                    s[field] = re.sub(r"20\d{2}\s*년", f"{edu_year_num}년", str(s[field]))
+
+        # 전체 슬라이드 제목·부제목·대본 내 '20XX년 N월' 교육 시기 오기입 교정
+        for field in ("title", "subtitle", "script"):
+            if s.get(field):
+                s[field] = wrong_ym_pattern.sub(correct_ym_text, str(s[field]))
 
     return slides_data
 
@@ -1354,7 +1383,8 @@ def create_slide_image_hd(slide_data, slide_idx, total_slides, output_path, font
             draw.rectangle([(cx1, cy1), (cx2, cy2)], outline=card_border_col, width=4)
 
         draw.line([(box_x1 + 85, box_y2 - 135), (box_x2 - 85, box_y2 - 135)], fill=card_border_col, width=3)
-        footer_info = f"품질안전부문 식품안전팀 곽정혁  |  {datetime.date.today().strftime('%Y년 %m월')}"
+        ym_label = slide_data.get("edu_ym_label") or datetime.date.today().strftime('%Y년 %m월')
+        footer_info = f"품질안전부문 식품안전팀 곽정혁  |  {ym_label}"
         draw.text((box_x1 + 85, box_y2 - 92), footer_info, font=f_card_title, fill=text_main_col)
         img.save(output_path, quality=95)
         return output_path
@@ -1671,19 +1701,20 @@ def generate_highres_image_pptx(slides_data, font_config, theme_mode, leader_pho
     pptx_io.seek(0)
     return pptx_io.getvalue()
 
-def build_fixed_event_slide(month_int, rank1, rank2, rank3, prize_amount="10,000원", prize_item="상당의 커피 기프티콘 증정", dialogue_mode=True):
+def build_fixed_event_slide(month_int, rank1, rank2, rank3, prize_amount="10,000원", prize_item="상당의 커피 기프티콘 증정", dialogue_mode=True, year_int=None):
     month_str = f"{month_int}월"
+    ym_full = f"{year_int}년 {month_str}" if year_int else month_str
     ranks_str = f"{rank1}번째, {rank2}번째, {rank3}번째"
     if dialogue_mode:
         script_text = (
-            f"진행자: 자, 오늘 함께 살펴본 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 아산공장 임직원 여러분 정말 고생 많으셨습니다.\n"
+            f"진행자: 자, 오늘 함께 살펴본 {ym_full} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 아산공장 임직원 여러분 정말 고생 많으셨습니다.\n"
             f"파트너: 맞습니다! 그리고 여러분이 가장 기다리시는 시간이죠, {month_str} 위생교육 퀴즈 이벤트 소식도 안내해 주셔야죠!\n"
             f"진행자: 네, 이번 {month_str}에는 위생교육 퀴즈 만점자분들 중에서 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 {prize_amount} {prize_item} 혜택을 드립니다!\n"
             f"파트너: 오늘 배운 핵심 수칙들 가볍게 복습하시면서 지금 바로 퀴즈 참여하시고, 기분 좋은 커피 기프티콘의 주인공이 되어보세요! 오늘도 안전한 하루 보내세요, 감사합니다!"
         )
     else:
         script_text = (
-            f"자, 오늘 준비한 {month_str} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 임직원 여러분 정말 고생 많으셨습니다. "
+            f"자, 오늘 준비한 {ym_full} 정기 위생교육 내용은 여기까지입니다! 현장에서 늘 애써주시는 임직원 여러분 정말 고생 많으셨습니다. "
             f"끝으로 기다리시던 {month_str} 위생교육 이벤트 안내드릴게요! "
             f"이번 {month_str}에는 퀴즈 만점자분들 중 순번 {rank1}번째, {rank2}번째, 그리고 {rank3}번째로 제출해 주신 행운의 주인공 세 분께 "
             f"{prize_amount} {prize_item} 혜택을 드립니다. 지금 바로 퀴즈도 푸시고 시원한 커피 기프티콘의 주인공이 되어보세요! 감사합니다."
@@ -1716,9 +1747,10 @@ def media_worker(idx, slide_data, total_slides, temp_dir, font_config, theme_mod
 # ==========================================
 # [11] Gemini 3.8 Flash 기획 및 10~15분 심층/대화형 대본 확장 엔진
 # ==========================================
-def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text, dialogue_mode=True):
+def generate_ai_storyboard(topic, edu_year_num, edu_month_str, body_slide_count, intro_config, uploaded_gemini_files, extra_source_text, dialogue_mode=True):
     client = get_genai_client(GEMINI_API_KEY)
     generation_config = types.GenerateContentConfig(temperature=0.25, max_output_tokens=65536)
+    edu_ym_full = f"{edu_year_num}년 {edu_month_str}"
 
     if intro_config["mode"] != "당부 말씀 슬라이드 생략":
         intro_instruction = f"""
@@ -1738,7 +1770,7 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
         script_style_rule = f"""
         [성우 대본("script") 작성 절대 원칙 - NotebookLM 2인 티키타카 대화형 (남성 메인 진행자 고정)]:
 - 화자 역할 고정: `진행자:`는 교육을 주관하는 **'식품안전팀 곽정혁' 본인(남성 메인 진행자)**이고, `파트너:`는 함께 호흡을 맞추며 질문·공감하는 보조 진행자입니다!
-- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 발화는 반드시 `진행자: {MANDATORY_OPENING_LINE}` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 {edu_month_str} 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
+- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 발화는 반드시 `진행자: {MANDATORY_OPENING_LINE}` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 `{edu_ym_full}` 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
 - 반드시 `진행자:`와 `파트너:` 두 명의 화자가 실제 스튜디오에서 마주 앉아 자연스럽게 묻고 답하며 맞장구치는 대화 형식으로 작성하십시오!
 - 각 발화 줄 맨 앞에 정확히 `진행자: ` 또는 `파트너: `를 붙이고 줄바꿈(`\\n`)으로 구분하십시오 (`진행자(곽정혁):`처럼 괄호를 넣지 마십시오).
 - 기계적인 낭독투 대신 "어? 그런데 현장에서 이 부분은 왜 특히 조심해야 할까요?", "아, 그거 정말 중요한 포인트예요! 왜냐하면요," 같은 실제 사람의 호흡과 추임새를 살리되, 법적 수치와 팩트는 100% 정확히 전달하십시오.
@@ -1747,7 +1779,7 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
         script_style_rule = f"""
         [성우 대본("script") 작성 절대 원칙 - 1인 남성 전문 강사 구어체]:
 - 화자는 교육을 주관하는 **'식품안전팀 곽정혁' 본인(남성 강사)**입니다.
-- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 문장은 반드시 `"{MANDATORY_OPENING_LINE}"` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 {edu_month_str} 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
+- **[첫 슬라이드 도입부 필수 고정 멘트]**: 가장 첫 번째 슬라이드(인덱스 0번)의 첫 문장은 반드시 `"{MANDATORY_OPENING_LINE}"` 로 시작해야 합니다! 이어지는 표지(COVER) 슬라이드에서는 이번 `{edu_ym_full}` 교육 핵심 주제('{topic}')를 명확히 소개하십시오.
 - 문어체("~함", "~바랍니다")를 피하고, 실제 인기 강사가 현장 작업자와 눈을 맞추며 대화하듯 생동감 있는 구어체("~거든요", "자, 여기서 꼭 기억할 포인트가 있습니다!")와 호흡용 쉼표(,)를 꼼꼼히 넣어 작성하십시오.
         """
 
@@ -1757,14 +1789,14 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
     원문에 없는 허위 수치나 규정을 임의로 추정·창작하지 마십시오.
     (※ 마지막 이벤트 안내 슬라이드는 파이썬 코드가 자동 결합하므로 생성하지 마십시오.)
 
-    [교육 월]: {edu_month_str}
+    [교육 기준 연월]: {edu_ym_full} (※ 절대 주의: 참고 문서나 영상에 2023년, 2024년, 2025년 등 과거 연도가 적혀 있더라도 이번 교육의 기준 연도는 반드시 `{edu_year_num}년`입니다! 표지의 `subtitle`이나 대본에 교육 시기를 적을 때 반드시 `{edu_ym_full}`로 표기하십시오.)
     [교육 핵심 주제]: {topic}
     [생성 장수]: 표지(COVER, 1장) + 목차(TOC_STEP, 1장) + 본론 상세({body_slide_count}장)
 
     {intro_instruction}
 
     [시각화 및 레이아웃("layout") 배정 핵심 규칙]:
-1. "COVER": 표지 슬라이드에도 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
+1. "COVER": 표지 슬라이드의 `subtitle`에는 `{edu_ym_full} 연세유업 아산공장 정기 위생교육` 형태로 정확한 연도({edu_year_num}년)를 기입하고, 우측에 들어갈 대표 3D 위생 도면 영문 프롬프트("visual_prompt")를 반드시 작성하십시오.
 2. "TOC_STEP": 3~5단계 전체 교육 목차 카드.
 3. 본론 슬라이드({body_slide_count}장) 중 **최소 70% 이상을 반드시 "SPLIT_VISUAL" 레이아웃으로 배정**하십시오!
   - 카드 본문("body")과 하단 요약("bottom_summary")은 도중에 끊기지 않도록 **끝맺음이 명확하고 완결된 문장(또는 완결된 개조식 구문)**으로 작성하며, 줄머리 기호는 폰트 깨짐이 없는 하이픈(`- `)만 사용하십시오 (`•`, `□` 사용 금지).
@@ -1835,8 +1867,9 @@ def generate_ai_storyboard(topic, edu_month_str, body_slide_count, intro_config,
                 continue
             return None, None, f"AI 기획안 생성 오류 ({PLANNING_MODEL}): {e}"
 
-def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dialogue_mode=True, has_intro_before=False):
+def generate_scripts_for_existing_pdf(pdf_pages_info, edu_year_num, edu_month_str, topic, dialogue_mode=True, has_intro_before=False):
     client = get_genai_client(GEMINI_API_KEY)
+    edu_ym_full = f"{edu_year_num}년 {edu_month_str}"
     slides_text_dump = "\n\n".join([f"[슬라이드 {p['page_num']} 텍스트]:\n{p['text']}" for p in pdf_pages_info])
     first_page_rule = (
         ""
@@ -1849,8 +1882,9 @@ def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dial
         f"실제 남성 전문 강사(식품안전팀 곽정혁)가 현장 작업자들과 눈을 맞추며 친근하게 설명하는 1인 구어체 내레이션으로 작성하십시오. {first_page_rule}"
     )
     prompt = f"""
-    다음은 연세유업 아산공장 '{edu_month_str} 정기 위생교육 ({topic})' 슬라이드 총 {len(pdf_pages_info)}장의 텍스트입니다.
+    다음은 연세유업 아산공장 '{edu_ym_full} 정기 위생교육 ({topic})' 슬라이드 총 {len(pdf_pages_info)}장의 텍스트입니다.
     슬라이드 1번부터 {len(pdf_pages_info)}번까지 단 한 장도 빠짐없이 대본(script)을 작성하십시오.
+    (※ 교육 기준 연월은 `{edu_ym_full}`이므로 교육 시기를 말할 때 과거 연도로 잘못 말하지 않도록 주의하십시오.)
     {spk_rule}
     원문에 있는 수치는 100% 정확하게 전달하고 없는 사실을 추측하지 마십시오.
 
@@ -1867,7 +1901,7 @@ def generate_scripts_for_existing_pdf(pdf_pages_info, edu_month_str, topic, dial
     clean_j = re.sub(r'^```json\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE).strip()
     return json.loads(clean_j)
 
-def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target_minutes, voice_speed=1.00, extra_source_text="", dialogue_mode=True):
+def expand_scripts_for_target_duration(slides_data, topic, edu_year_num, edu_month_str, target_minutes, voice_speed=1.00, extra_source_text="", dialogue_mode=True):
     """
     말하기 속도를 늦추지 않고 목표 시간(10~15분)을 채우기 위해,
     4장 단위 병렬 배치로 슬라이드별 대본을 팩트 기반 심층 대화/강의로 확장합니다.
@@ -1875,6 +1909,7 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
     if not slides_data or target_minutes <= 4:
         return slides_data
 
+    edu_ym_full = f"{edu_year_num}년 {edu_month_str}"
     chars_per_min = int(420 * float(voice_speed))
     total_target_chars = int(target_minutes * chars_per_min)
     current_total_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in slides_data)
@@ -1925,10 +1960,10 @@ def expand_scripts_for_target_duration(slides_data, topic, edu_month_str, target
         joined_batch = "\n\n".join(batch_desc)
         prompt = f"""
         당신은 연세유업 아산공장 식품안전팀의 위생교육 방송 작가입니다.
-        이번 '{edu_month_str} 정기 위생교육 ({topic})' 영상이 법정 교육 시간 기준인 총 {target_minutes}분 분량을 정상 말속도로 자연스럽게 채울 수 있도록, 아래 슬라이드들의 대본("script")을 심층 확장하십시오.
+        이번 '{edu_ym_full} 정기 위생교육 ({topic})' 영상이 법정 교육 시간 기준인 총 {target_minutes}분 분량을 정상 말속도로 자연스럽게 채울 수 있도록, 아래 슬라이드들의 대본("script")을 심층 확장하십시오.
 
         [절대 준수 규칙]:
-1. 팩트 엄수 (추정·창작 금지): 슬라이드 카드·표·기존 대본 및 참고 원문에 명시된 기준과 수치만 사용하십시오. 원문에 없는 과태료, 법조항 번호, 온도 수치를 절대 지어내지 마십시오.
+1. 팩트 엄수 및 연도 정확성 (추정·창작 금지): 슬라이드 카드·표·기존 대본 및 참고 원문에 명시된 기준과 수치만 사용하십시오. 원문에 없는 과태료, 법조항 번호, 온도 수치를 절대 지어내지 마십시오. 이번 교육 기준 연월은 `{edu_ym_full}`이므로 2024년·2025년 등 과거 연도로 잘못 언급하지 마십시오.
 2. 고정 슬라이드 보존:
   - `slide_idx: 0`이 포함되어 있다면 대본 맨 첫 문장을 반드시 '{'진행자: ' if dialogue_mode else ''}{MANDATORY_OPENING_LINE}' 로 시작하십시오.
   - 'INTRO_1TOP_3BOT'(당부말씀)는 생산본부장, 유제품생산부문장, 상온제품생산부문장, 품질안전부문장 4분의 핵심 당부 말씀을 모두 빠짐없이 소개하고 현장 실천 다짐을 나누십시오.
@@ -2001,7 +2036,7 @@ def main():
             else:
                 st.session_state[key] = None
 
-    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(남성 진행 고정 · 잘림 0% Auto-Fit · 10~15분 통합판)</span></h1>", unsafe_allow_html=True)
+    st.markdown("<h1>🎬 연세유업 AI 위생교육 스튜디오 <span style='font-size:0.45em; color:#64748b;'>(연도·월 일치 · 남성 진행 고정 · 잘림 0% Auto-Fit)</span></h1>", unsafe_allow_html=True)
     st.markdown(f"유료 Gemini API 단일 연결로 **`{MANDATORY_OPENING_LINE}` 남성 오프닝 고정**, **문장 잘림 없는 Auto-Fit 슬라이드**, **10~15분 법정 교육 시간 맞춤 대본**을 원클릭으로 제작합니다.")
     st.markdown("<hr>", unsafe_allow_html=True)
 
@@ -2142,19 +2177,23 @@ def main():
         }
 
     tab1, tab2, tab3 = st.tabs([
-        "1. 교육 자료·목표 시간(10~15분) & 당부말씀 설정",
+        "1. 교육 연도·월·목표 시간(10~15분) & 당부말씀 설정",
         "2. 고해상도 슬라이드 미리보기 & 대화 대본·도면 편집",
         "3. 고해상도 이미지 PPTX & NotebookLM 성우 MP4 렌더링"
     ])
 
     # ==========================================
-    # 탭 1: 입력 및 기획 생성
+    # 탭 1: 입력 및 기획 생성 (교육 기준 연도 입력 추가)
     # ==========================================
     with tab1:
-        col_m1, col_m2, col_m3 = st.columns([1, 2, 1.3])
+        today_dt = datetime.date.today()
+        col_m0, col_m1, col_m2, col_m3 = st.columns([0.9, 0.8, 2.0, 1.3])
+        with col_m0:
+            edu_year_num = st.number_input("교육 기준 연도:", min_value=2024, max_value=2035, value=int(today_dt.year), step=1)
         with col_m1:
-            edu_month_num = st.number_input("교육 기준 월:", min_value=1, max_value=12, value=11, step=1)
+            edu_month_num = st.number_input("교육 기준 월:", min_value=1, max_value=12, value=int(today_dt.month), step=1)
             edu_month_str = f"{edu_month_num}월"
+            edu_ym_full_str = f"{edu_year_num}년 {edu_month_str}"
         with col_m2:
             topic = st.text_input("이번 달 위생교육 핵심 주제:", value="작업장 이물혼입 예방 및 영업장 위생관리")
         with col_m3:
@@ -2298,7 +2337,7 @@ def main():
         st.markdown("---")
 
         # --- Step 3: 고정 양식 이벤트 안내 ---
-        st.markdown(f"### 🎁 Step 3. 클로징: {edu_month_str} 위생교육 이벤트 안내 (월별 순번 자동 계산 고정 양식)")
+        st.markdown(f"### 🎁 Step 3. 클로징: {edu_ym_full_str} 위생교육 이벤트 안내 (월별 순번 자동 계산 고정 양식)")
         include_outro = st.checkbox("마지막 슬라이드에 고정 양식 이벤트 페이지 자동 추가", value=True)
         if include_outro:
             default_r1 = int(edu_month_num)
@@ -2317,11 +2356,11 @@ def main():
         st.markdown("<br>", unsafe_allow_html=True)
 
         mode_btn_label = "NotebookLM 2인 대화형(남성진행)" if gemini_dialogue else "남성 전문강사 구어체"
-        if st.button(f"🚀 목표 {target_video_mins}분 맞춤 [{mode_btn_label}] 대본 & Auto-Fit 3D 슬라이드 일괄 생성 시작", type="primary", use_container_width=True):
+        if st.button(f"🚀 {edu_ym_full_str} 기준 · 목표 {target_video_mins}분 [{mode_btn_label}] 대본 & Auto-Fit 3D 슬라이드 생성 시작", type="primary", use_container_width=True):
             if not GEMINI_API_KEY:
                 st.error("Streamlit Secrets에 GOOGLE_API_KEY 또는 GEMINI_API_KEY를 설정해주세요.")
             elif "표준 모드" in workflow_mode:
-                with st.spinner(f"1/2단계: [{PLANNING_MODEL}] 슬라이드 기획 및 [{mode_btn_label}] 초안 설계 중..."):
+                with st.spinner(f"1/2단계: [{PLANNING_MODEL}] {edu_ym_full_str} 슬라이드 기획 및 [{mode_btn_label}] 초안 설계 중..."):
                     gemini_files = []
                     combined_text = extra_source_text
 
@@ -2348,7 +2387,7 @@ def main():
 
                     intro_cfg = {"mode": intro_mode, "custom_text": intro_custom_text}
                     slides, pre_log, err = generate_ai_storyboard(
-                        topic, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text, dialogue_mode=gemini_dialogue
+                        topic, edu_year_num, edu_month_str, body_slide_count, intro_cfg, gemini_files, combined_text, dialogue_mode=gemini_dialogue
                     )
 
                 if err:
@@ -2369,12 +2408,23 @@ def main():
                             ]
 
                     if include_outro:
-                        slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount, dialogue_mode=gemini_dialogue))
+                        slides.append(
+                            build_fixed_event_slide(
+                                edu_month_num,
+                                ev_rank1,
+                                ev_rank2,
+                                ev_rank3,
+                                ev_prize_amount,
+                                dialogue_mode=gemini_dialogue,
+                                year_int=edu_year_num
+                            )
+                        )
 
                     with st.spinner(f"2/2단계: 약 {target_video_mins}분 분량 [{mode_btn_label}] 대본 심층 확장 및 [{VISUAL_OMNI_MODEL}] 3D 도면 생성 중..."):
                         slides = expand_scripts_for_target_duration(
                             slides,
                             topic=topic,
+                            edu_year_num=edu_year_num,
                             edu_month_str=edu_month_str,
                             target_minutes=target_video_mins,
                             voice_speed=voice_speed,
@@ -2382,6 +2432,7 @@ def main():
                             dialogue_mode=gemini_dialogue
                         )
                         slides = enforce_opening_greeting(slides, dialogue_mode=gemini_dialogue)
+                        slides = enforce_edu_year_consistency(slides, edu_year_num, edu_month_num)
 
                         local_custom_fonts = dict(st.session_state.get("custom_font_paths", {}))
 
@@ -2409,18 +2460,19 @@ def main():
                     st.session_state["pre_calc_log"] = pre_log
                     st.session_state["final_video_bytes"] = None
                     st.session_state["final_pptx_bytes"] = None
-                    st.success(f"총 {len(slides)}장 생성 완료! (순수 대사 {pure_chars:,}자 · 정상 배속 예상 시간 약 {est_min_done:.1f}분) [2번 탭]에서 확인하세요.")
+                    st.success(f"총 {len(slides)}장 생성 완료! ({edu_ym_full_str} 기준 · 순수 대사 {pure_chars:,}자 · 예상 시간 약 {est_min_done:.1f}분) [2번 탭]에서 확인하세요.")
             else:
                 if not existing_pdf_file:
                     st.warning("PDF 파일을 먼저 업로드해주세요.")
                 elif not PYMUPDF_AVAILABLE:
                     st.error("requirements.txt에 PyMuPDF를 추가해주세요.")
                 else:
-                    with st.spinner(f"PDF 고해상도 추출 및 목표 {target_video_mins}분 [{mode_btn_label}] 대본 생성 중..."):
+                    with st.spinner(f"PDF 고해상도 추출 및 {edu_ym_full_str} 기준 목표 {target_video_mins}분 [{mode_btn_label}] 대본 생성 중..."):
                         has_intro_flag = (intro_mode != "당부 말씀 슬라이드 생략")
                         pages_info = extract_pages_from_pdf(existing_pdf_file.getvalue())
                         scripts_list = generate_scripts_for_existing_pdf(
                             pages_info,
+                            edu_year_num,
                             edu_month_str,
                             topic,
                             dialogue_mode=gemini_dialogue,
@@ -2431,18 +2483,18 @@ def main():
                         if has_intro_flag:
                             if "통째로" in intro_mode:
                                 intro_sc = (
-                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 살펴보겠습니다. {intro_custom_text}\n"
+                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_ym_full_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 살펴보겠습니다. {intro_custom_text}\n"
                                     f"파트너: 네, 현장에서 꼭 마음에 새기고 실천해야 할 핵심 당부 말씀이네요! 그럼 본격적인 교육을 시작해 볼까요?"
                                     if gemini_dialogue else
-                                    f"{MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {intro_custom_text}"
+                                    f"{MANDATORY_OPENING_LINE} {edu_ym_full_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {intro_custom_text}"
                                 )
                             else:
                                 intro_sc = (
-                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 짚어보겠습니다. 먼저 생산본부장님께서는 {ldr_prod}\n"
+                                    f"진행자: {MANDATORY_OPENING_LINE} {edu_ym_full_str} 정기 위생교육 시작에 앞서 생산본부장님과 각 부문장님들의 당부 말씀을 함께 짚어보겠습니다. 먼저 생산본부장님께서는 {ldr_prod}\n"
                                     f"파트너: 네, 이어서 유제품생산부문장님께서는 {ldr_dairy} 그리고 상온제품생산부문장님께서는 {ldr_ambient}\n"
                                     f"진행자: 끝으로 품질안전부문장님께서는 {ldr_qc} 라고 강조해 주셨습니다. 현장에서 꼭 함께 실천해 주시길 바랍니다!"
                                     if gemini_dialogue else
-                                    f"{MANDATORY_OPENING_LINE} {edu_month_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
+                                    f"{MANDATORY_OPENING_LINE} {edu_ym_full_str} 정기 위생교육을 시작하기에 앞서, 생산본부장님과 각 부문장님들의 당부 말씀을 먼저 전해드립니다. {ldr_prod} 이어서 유제품생산부문장님께서는 {ldr_dairy} 상온제품생산부문장님께서는 {ldr_ambient} 끝으로 품질안전부문장님께서는 {ldr_qc}"
                                 )
 
                             intro_slide_obj = {
@@ -2475,11 +2527,22 @@ def main():
                             })
 
                         if include_outro:
-                            built_slides.append(build_fixed_event_slide(edu_month_num, ev_rank1, ev_rank2, ev_rank3, ev_prize_amount, dialogue_mode=gemini_dialogue))
+                            built_slides.append(
+                                build_fixed_event_slide(
+                                    edu_month_num,
+                                    ev_rank1,
+                                    ev_rank2,
+                                    ev_rank3,
+                                    ev_prize_amount,
+                                    dialogue_mode=gemini_dialogue,
+                                    year_int=edu_year_num
+                                )
+                            )
 
                         built_slides = expand_scripts_for_target_duration(
                             built_slides,
                             topic=topic,
+                            edu_year_num=edu_year_num,
                             edu_month_str=edu_month_str,
                             target_minutes=target_video_mins,
                             voice_speed=voice_speed,
@@ -2487,13 +2550,14 @@ def main():
                             dialogue_mode=gemini_dialogue
                         )
                         built_slides = enforce_opening_greeting(built_slides, dialogue_mode=gemini_dialogue)
+                        built_slides = enforce_edu_year_consistency(built_slides, edu_year_num, edu_month_num)
 
                         pure_chars = sum(len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(s.get("script", ""))).strip()) for s in built_slides)
                         est_min_done = (pure_chars / (420.0 * voice_speed)) + (len(built_slides) * 0.6 / 60.0)
                         st.session_state["slides_data"] = built_slides
                         st.session_state["final_video_bytes"] = None
                         st.session_state["final_pptx_bytes"] = None
-                        st.success(f"총 {len(built_slides)}장 준비 완료! (순수 대사 {pure_chars:,}자 · 예상 시간 약 {est_min_done:.1f}분) [2번 탭]으로 이동하세요.")
+                        st.success(f"총 {len(built_slides)}장 준비 완료! ({edu_ym_full_str} 기준 · 순수 대사 {pure_chars:,}자 · 예상 시간 약 {est_min_done:.1f}분) [2번 탭]으로 이동하세요.")
 
     # ==========================================
     # 탭 2: Full-HD 슬라이드 미리보기 & 대화 대본/도면 편집
@@ -2509,7 +2573,7 @@ def main():
 
             st.markdown("### 🖥️ Full-HD(1920×1080) 슬라이드 미리보기 및 대화형 대본·3D 도면 편집")
             st.info(
-                f"⏱️ **현재 대본 분량 진단:** 총 **{total_s}장** | 순수 대사 **{pure_total_chars:,}자** "
+                f"⏱️ **현재 대본 분량 진단 ({edu_ym_full_str} 기준):** 총 **{total_s}장** | 순수 대사 **{pure_total_chars:,}자** "
                 f"➡️ 현재 속도(`{voice_speed:.2f}x`) 기준 **예상 영상 길이: 약 {est_mm}분 {est_ss:02d}초** "
                 f"({'NotebookLM 2인 대화 모드(남성진행)' if gemini_dialogue else '1인 남성 강사 모드'})"
             )
@@ -2518,6 +2582,7 @@ def main():
 
             with tempfile.TemporaryDirectory() as preview_dir:
                 for idx, slide in enumerate(st.session_state["slides_data"]):
+                    slide["edu_ym_label"] = f"{edu_year_num}년 {edu_month_num:02d}월"
                     cur_pure_len = len(re.sub(r'(진행자|파트너)\s*:\s*', '', str(slide.get("script", ""))).strip())
                     cur_sec = int(cur_pure_len / (7.0 * voice_speed))
                     is_expanded = (idx in (0, 1, total_s - 1))
@@ -2525,13 +2590,18 @@ def main():
                         col_p1, col_p2 = st.columns([1.2, 1])
                         with col_p2:
                             new_title = st.text_input("슬라이드 제목", value=slide.get("title", ""), key=f"t_{idx}")
+                            slide["title"] = new_title
+
+                            if slide.get("layout") == "COVER":
+                                new_sub = st.text_input("표지 부제목 (교육 연도·월 표기)", value=slide.get("subtitle", ""), key=f"sub_{idx}")
+                                slide["subtitle"] = new_sub
+
                             new_script = st.text_area(
                                 "성우 대본 (`진행자:`=남성 곽정혁 / `파트너:`=보조 진행자)",
                                 value=slide.get("script", ""),
                                 height=195,
                                 key=f"s_{idx}"
                             )
-                            slide["title"] = new_title
                             slide["script"] = new_script
 
                             if slide.get("layout") not in ("INTRO_1TOP_3BOT", "INTRO_4GRID", "OUTRO_EVENT", "CUSTOM_PDF_PAGE", "COVER"):
@@ -2591,7 +2661,7 @@ def main():
             st.info("먼저 [1번 탭]에서 슬라이드 기획을 실행해 주십시오.")
         else:
             slides_to_render = st.session_state["slides_data"]
-            st.markdown(f"### 🎬 최종 결과물 렌더링 및 다운로드 (총 {len(slides_to_render)}장 · 1920×1080 Full-HD)")
+            st.markdown(f"### 🎬 최종 결과물 렌더링 및 다운로드 ({edu_ym_full_str} · 총 {len(slides_to_render)}장 · 1920×1080 Full-HD)")
 
             col_b1, col_b2 = st.columns(2)
             with col_b1:
@@ -2609,7 +2679,7 @@ def main():
                     st.download_button(
                         label="📥 파워포인트(.pptx) 파일 다운로드",
                         data=st.session_state["final_pptx_bytes"],
-                        file_name=f"연세유업_{edu_month_str}_위생교육_{datetime.date.today().strftime('%Y%m%d')}.pptx",
+                        file_name=f"연세유업_{edu_year_num}년_{edu_month_str}_위생교육_{datetime.date.today().strftime('%Y%m%d')}.pptx",
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         use_container_width=True
                     )
@@ -2689,7 +2759,7 @@ def main():
                 st.download_button(
                     label="📥 완성된 MP4 교육 영상 다운로드",
                     data=st.session_state["final_video_bytes"],
-                    file_name=f"연세유업_{edu_month_str}_위생교육영상_{datetime.date.today().strftime('%Y%m%d')}.mp4",
+                    file_name=f"연세유업_{edu_year_num}년_{edu_month_str}_위생교육영상_{datetime.date.today().strftime('%Y%m%d')}.mp4",
                     mime="video/mp4",
                     type="primary",
                     use_container_width=True
